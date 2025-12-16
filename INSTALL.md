@@ -86,18 +86,14 @@ cd ../../..
 ### Step 7: Verify Installation
 
 ```bash
-python -c "
-import numpy as np
-import scipy
-import torch
-import pyastar2d
-import range_libc
-print(f'NumPy: {np.__version__}')
-print(f'SciPy: {scipy.__version__}')
-print(f'PyTorch: {torch.__version__}')
-print(f'CUDA available: {torch.cuda.is_available()}')
-print('✓ All dependencies installed successfully!')
-"
+# Quick check (single line - safe to copy)
+python -c "import range_libc; import pyastar2d; import torch; print('OK! CUDA:', torch.cuda.is_available())"
+```
+
+Or run the full verification script:
+
+```bash
+python -c "import numpy as np; import scipy; import torch; import pyastar2d; import range_libc; print(f'NumPy: {np.__version__}'); print(f'SciPy: {scipy.__version__}'); print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}'); print('OK!')"
 ```
 
 ## Download Data & Models
