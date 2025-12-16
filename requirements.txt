@@ -1,0 +1,68 @@
+# NBH (Next Best Hallucination) Requirements
+# Python 3.11 compatible
+# 
+# ⚠️  IMPORTANT: Follow the installation steps in INSTALL.md
+#     Some packages require special installation procedures.
+
+# ==============================================================================
+# Core dependencies (MUST install numpy first before range_libc)
+# ==============================================================================
+numpy>=1.24.0,<2.0      # numpy 2.x breaks range_libc Cython bindings
+scipy>=1.10.0,<1.14     # scipy 1.14+ requires numpy 2.x
+matplotlib>=3.7.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# ==============================================================================
+# Deep Learning
+# ==============================================================================
+torch>=2.0.0
+torchvision>=0.15.0
+pytorch-lightning>=2.0.0
+torchmetrics>=1.0.0
+kornia>=0.7.0
+
+# ==============================================================================
+# Config management
+# ==============================================================================
+hydra-core>=1.3.0
+omegaconf>=2.3.0
+pyyaml>=6.0
+
+# ==============================================================================
+# Image processing and scientific computing
+# ==============================================================================
+scikit-image>=0.21.0
+scikit-learn>=1.3.0
+albumentations>=1.3.0
+
+# ==============================================================================
+# Utilities
+# ==============================================================================
+tqdm>=4.65.0
+numba>=0.57.0
+shapely>=2.0.0
+easydict>=1.10
+tabulate>=0.9.0
+pandas>=2.0.0
+joblib>=1.3.0
+
+# ==============================================================================
+# For range_libc & pyastar2d compilation
+# ==============================================================================
+Cython>=3.0.0
+setuptools
+wheel
+
+# ==============================================================================
+# Web and data handling
+# ==============================================================================
+webdataset>=0.2.0
+packaging>=23.0
+
+# ==============================================================================
+# NOTE: These require special installation (see INSTALL.md)
+# ==============================================================================
+# pyastar2d>=1.0.6      # Install with: pip install --no-build-isolation pyastar2d
+# range_libc            # Build from source in external/range_libc/pywrapper
+
