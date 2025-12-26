@@ -82,3 +82,10 @@ Thumbs.db
 *.zip
 project_summary.json
 
+
+# Ablation study experiments (large files)
+experiments/ablation_study/*.npz
+experiments/ablation_study/*.png
+experiments/ablation_study/*/run_viz/
+experiments/ablation_study/*/global_obs/
+experiments/ablation_study/*/graph_map/
