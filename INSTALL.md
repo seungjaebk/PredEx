@@ -12,7 +12,7 @@ This guide provides step-by-step instructions for setting up the NBH (Next Best 
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/nbh.git
+git clone https://github.com/seungjaebk/nbh.git
 cd nbh
 
 # Run the setup script
