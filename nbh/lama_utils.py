@@ -31,7 +31,7 @@ def get_lama_padding_transform():
     lama_padding_transform = A.PadIfNeeded(
         min_height=None, min_width=None, 
         pad_height_divisor=16, pad_width_divisor=16, 
-        border_mode=cv2.BORDER_CONSTANT, value=0
+        border_mode=cv2.BORDER_CONSTANT
     )
     return lama_padding_transform
 

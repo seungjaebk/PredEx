@@ -18,9 +18,7 @@ import range_libc
 from shapely.geometry import Polygon, Point, MultiPolygon
 
 # custom imports
-import sys
-sys.path.append('../')
-from sim_utils import makePyOMap
+from utils.pyomap_utils import makePyOMap
 
 class TimeoutException(Exception):   # Custom exception class
     pass
@@ -946,7 +944,7 @@ def make_data_folders(data_output_folder_name):
 def convert_01_single_channel_to_0_255_3_channel(img):
     img = np.stack([img, img, img], axis=2)
     img *= 255
-    return img
+    return img.astype(np.uint8)
 
 def convert_012_labels_to_maskutils_labels(occ_map):
     """Converts occupancy map that is of 012 label (0: unknown, 1: occupied, 2: free) 

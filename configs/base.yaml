@@ -13,10 +13,10 @@
 # - 50037764_PLAN1 (7764_PLAN1)
 # - 50037765_PLAN3 (7765_PLAN3)
 # - 50052748 (2748)
-collect_world_list: ['50015847']
+collect_world_list: ['50052749']
 output_folder_name: 'experiments'
 
-start_pose: [927, 544]
+start_pose: [818, 580]
 
 #modes_to_test: ['nearest', 'nbv-2d', 'onlyvar', 'visunk', 'visvar', 'mapex', 'upen', 'hectoraug', 'pipe', 'pw-nbv-2d'] #all methods
 modes_to_test: ['nbh']

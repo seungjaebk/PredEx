@@ -34,6 +34,7 @@ class CellManager:
             valid_space_map: Optional valid space map (for reference only, not used for ghost creation)
         """
         self.cell_size = cell_size
+        self.free_mask = None
         
         # Robot's start position is the centroid of cell (0, 0)
         # This will be set on first update_graph call if not provided
@@ -90,7 +91,7 @@ class CellManager:
             self.cells[index] = CellNode(index, center, is_ghost=is_ghost)
         return self.cells[index]
 
-    def update_graph_structure(self, obs_map, pred_mean_map, pred_var_map=None, max_ghost_distance=2):
+    def update_graph_structure(self, obs_map, pred_mean_map, pred_var_map=None, max_ghost_distance=2, free_mask=None):
         """
         Update cell graph based on current observations and predictions.
         
@@ -104,6 +105,7 @@ class CellManager:
             max_ghost_distance: Max cell distance from observed cell for ghost expansion
         """
         map_h, map_w = obs_map.shape
+        self.free_mask = free_mask
         
         # --- 1. UPDATE REAL NODES (Observed) ---
         # Expand from existing cells + their neighbors
@@ -166,20 +168,55 @@ class CellManager:
             
             if patch_obs.size == 0: continue
 
+            # Centroid lookup (absolute pixel coords)
+            centroid_r = int(cell_center[0])
+            centroid_c = int(cell_center[1])
+            if not (0 <= centroid_r < map_h and 0 <= centroid_c < map_w):
+                continue
+
+            centroid_obs_val = obs_map[centroid_r, centroid_c]
+
             # Check Obstacle status
             is_obs_blocked = np.mean(patch_obs == 1) > 0.3 # If >30% occupied
+            if centroid_obs_val >= 0.8:
+                is_obs_blocked = True
             
             # Check Unknown status
-            is_unknown = np.mean(patch_obs == 0.5) > 0.5
+            unknown_ratio = float(np.mean(patch_obs == 0.5))
+            centroid_unknown = (centroid_obs_val == 0.5)
+            is_unknown = (unknown_ratio > 0.5) and centroid_unknown
             
             # Check Prediction status (Ghost)
-            # If unknown but Predicted Free (< 0.5 prob of wall), it's a Ghost Candidate
+            # If unknown but Predicted Free (< 0.3 prob of wall), it's a Ghost Candidate
             is_pred_free = False
-            if patch_pred is not None:
-                # pred_mean is probability of occupancy? usually 0=Free, 1=Occ
-                # Let's assume [0,1] range.
-                avg_pred = np.mean(patch_pred)
-                is_pred_free = avg_pred < 0.4
+            pred_center = None
+            if pred_mean_map is not None:
+                pred_h, pred_w = pred_mean_map.shape
+                if 0 <= centroid_r < pred_h and 0 <= centroid_c < pred_w:
+                    # pred_mean is probability of occupancy? usually 0=Free, 1=Occ
+                    # Let's assume [0,1] range.
+                    pred_center = float(pred_mean_map[centroid_r, centroid_c])
+                    is_pred_free = pred_center < 0.3
+
+            # Prediction variance at centroid (for debug and gating)
+            pred_var_center = None
+            if pred_var_map is not None:
+                var_h, var_w = pred_var_map.shape
+                if 0 <= centroid_r < var_h and 0 <= centroid_c < var_w:
+                    pred_var_center = float(pred_var_map[centroid_r, centroid_c])
+
+            # Debug: inspect specific cells near start
+            debug_indices = {(0, -1), (1, 0)}
+            if idx in debug_indices:
+                pred_mean_str = f"{pred_center:.3f}" if pred_center is not None else "NA"
+                pred_var_str = f"{pred_var_center:.3f}" if pred_var_center is not None else "NA"
+                ghost_distance = distances.get(idx, float('inf'))
+                print(
+                    f"[DEBUG][GHOST_CAND] idx={idx} "
+                    f"unknown_ratio={unknown_ratio:.3f} centroid_obs={centroid_obs_val:.2f} "
+                    f"pred_mean={pred_mean_str} pred_var={pred_var_str} "
+                    f"is_obs_blocked={is_obs_blocked} ghost_distance={ghost_distance}"
+                )
             
             # Node Creation / Update Logic
             if is_obs_blocked:
@@ -199,9 +236,9 @@ class CellManager:
                 cell_variance = 1.0  # Default high (don't expand)
                 
                 if pred_var_map is not None:
-                    patch_var = pred_var_map[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
-                    if patch_var.size > 0:
-                        cell_variance = float(np.mean(patch_var))
+                    var_h, var_w = pred_var_map.shape
+                    if 0 <= centroid_r < var_h and 0 <= centroid_c < var_w:
+                        cell_variance = float(pred_var_map[centroid_r, centroid_c])
                 
                 # Only create ghost if:
                 # 1. Variance is below threshold (model is confident it's free)
@@ -227,10 +264,15 @@ class CellManager:
                 if (nr, nc) in self.cells:
                     neighbor = self.cells[(nr, nc)]
                     if not neighbor.is_blocked:
-                        # CHECK: Is there free space at the shared boundary?
-                        # For ghost cells, also check predicted map for walls
-                        if self._check_path_clear(idx, (nr, nc), obs_map, pred_mean_map, node.is_ghost or neighbor.is_ghost):
-                            node.neighbors.append(neighbor)
+                        involves_ghost = node.is_ghost or neighbor.is_ghost
+                        if not involves_ghost and self.free_mask is not None:
+                            # Real-real edges: use portal check on inflated free space
+                            if self._check_portal_clear(idx, (nr, nc), self.free_mask) and self._check_path_clear(idx, (nr, nc), obs_map, pred_mean_map, involves_ghost=False):
+                                node.neighbors.append(neighbor)
+                        else:
+                            # Ghost-involved edges: keep strict line-of-sight check
+                            if self._check_path_clear(idx, (nr, nc), obs_map, pred_mean_map, involves_ghost):
+                                node.neighbors.append(neighbor)
     
     def _check_path_clear(self, node_idx, neighbor_idx, obs_map, pred_mean_map=None, involves_ghost=False):
         """
@@ -269,6 +311,80 @@ class CellManager:
         
         # Centroid line is clear
         return True
+
+    def _check_portal_clear(self, node_idx, neighbor_idx, free_mask, thickness=2):
+        """
+        Check if there exists a traversable "portal" across the shared boundary
+        between two adjacent real cells using a thin strip of free space.
+        """
+        if free_mask is None:
+            return False
+
+        h, w = free_mask.shape
+        thickness = max(1, int(thickness))
+
+        a_center = self.get_cell_center(node_idx).astype(int)
+        b_center = self.get_cell_center(neighbor_idx).astype(int)
+        half = self.cell_size // 2
+
+        a_r0 = max(0, int(a_center[0] - half))
+        a_r1 = min(h, int(a_center[0] + half))
+        a_c0 = max(0, int(a_center[1] - half))
+        a_c1 = min(w, int(a_center[1] + half))
+
+        b_r0 = max(0, int(b_center[0] - half))
+        b_r1 = min(h, int(b_center[0] + half))
+        b_c0 = max(0, int(b_center[1] - half))
+        b_c1 = min(w, int(b_center[1] + half))
+
+        dr = neighbor_idx[0] - node_idx[0]
+        dc = neighbor_idx[1] - node_idx[1]
+
+        if dr == 0 and dc == 1:
+            # neighbor to the right
+            a_strip = free_mask[a_r0:a_r1, max(a_c1 - thickness, a_c0):a_c1]
+            b_strip = free_mask[b_r0:b_r1, b_c0:min(b_c0 + thickness, b_c1)]
+            min_len = min(a_strip.shape[0], b_strip.shape[0])
+            if min_len <= 0:
+                return False
+            a_strip = a_strip[:min_len, :]
+            b_strip = b_strip[:min_len, :]
+            return np.any(np.any(a_strip, axis=1) & np.any(b_strip, axis=1))
+
+        if dr == 0 and dc == -1:
+            # neighbor to the left
+            a_strip = free_mask[a_r0:a_r1, a_c0:min(a_c0 + thickness, a_c1)]
+            b_strip = free_mask[b_r0:b_r1, max(b_c1 - thickness, b_c0):b_c1]
+            min_len = min(a_strip.shape[0], b_strip.shape[0])
+            if min_len <= 0:
+                return False
+            a_strip = a_strip[:min_len, :]
+            b_strip = b_strip[:min_len, :]
+            return np.any(np.any(a_strip, axis=1) & np.any(b_strip, axis=1))
+
+        if dr == 1 and dc == 0:
+            # neighbor below
+            a_strip = free_mask[max(a_r1 - thickness, a_r0):a_r1, a_c0:a_c1]
+            b_strip = free_mask[b_r0:min(b_r0 + thickness, b_r1), b_c0:b_c1]
+            min_len = min(a_strip.shape[1], b_strip.shape[1])
+            if min_len <= 0:
+                return False
+            a_strip = a_strip[:, :min_len]
+            b_strip = b_strip[:, :min_len]
+            return np.any(np.any(a_strip, axis=0) & np.any(b_strip, axis=0))
+
+        if dr == -1 and dc == 0:
+            # neighbor above
+            a_strip = free_mask[a_r0:min(a_r0 + thickness, a_r1), a_c0:a_c1]
+            b_strip = free_mask[max(b_r1 - thickness, b_r0):b_r1, b_c0:b_c1]
+            min_len = min(a_strip.shape[1], b_strip.shape[1])
+            if min_len <= 0:
+                return False
+            a_strip = a_strip[:, :min_len]
+            b_strip = b_strip[:, :min_len]
+            return np.any(np.any(a_strip, axis=0) & np.any(b_strip, axis=0))
+
+        return False
     
     def diffuse_scent(self, pred_var_map):
         """
@@ -288,20 +404,13 @@ class CellManager:
                 continue
                 
             if node.is_ghost:
-                # Extract variance for this cell using absolute pixel coords
-                cell_center = node.center
-                half = self.cell_size // 2
-                
-                y_start = max(0, int(cell_center[0] - half))
-                y_end = min(map_h, int(cell_center[0] + half))
-                x_start = max(0, int(cell_center[1] - half))
-                x_end = min(map_w, int(cell_center[1] + half))
-                
-                if y_start < y_end and x_start < x_end:
-                    patch_var = pred_var_map[y_start:y_end, x_start:x_end]
-                    if patch_var.size > 0:
-                        # Sum of variance is the total "Information Mass"
-                        node.base_value = np.sum(patch_var)
+                # Use centroid variance for consistent scoring
+                centroid_r = int(node.center[0])
+                centroid_c = int(node.center[1])
+                if 0 <= centroid_r < map_h and 0 <= centroid_c < map_w:
+                    node.base_value = float(pred_var_map[centroid_r, centroid_c])
+                else:
+                    node.base_value = 0.0
             
             # Reset propagation to base
             node.propagated_value = node.base_value
@@ -333,7 +442,7 @@ class CellManager:
         
         # Note: scent_map_vis is no longer used (indices can be negative now)
 
-    def update_graph(self, robot_pose, obs_map, pred_mean_map=None, pred_var_map=None):
+    def update_graph(self, robot_pose, obs_map, pred_mean_map=None, pred_var_map=None, inflated_occ_grid=None):
         """Main update loop called by agent."""
         # 0. Set origin on first call (robot's start = cell (0,0) centroid)
         if self.origin is None:
@@ -341,7 +450,10 @@ class CellManager:
             print(f"[GRAPH] Origin set to robot start: {self.origin}")
         
         # 1. Update structure (Real + Ghost nodes)
-        self.update_graph_structure(obs_map, pred_mean_map, pred_var_map=pred_var_map)
+        free_mask = None
+        if inflated_occ_grid is not None:
+            free_mask = np.isfinite(inflated_occ_grid)
+        self.update_graph_structure(obs_map, pred_mean_map, pred_var_map=pred_var_map, free_mask=free_mask)
         
         # 2. Update current position
         curr_idx = self.get_cell_index(robot_pose)

@@ -12,13 +12,8 @@ from matplotlib import pyplot as plt
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import unary_union
 
-# custom imports
-import sys
-sys.path.append('../')
-import simple_mask_utils as smu
-
-def makePyOMap(occ_grid):
-    return range_libc.PyOMap(occ_grid)
+from utils import simple_mask_utils as smu
+from utils.pyomap_utils import makePyOMap
 
 def psuedo_traj_controller(plan_x, plan_y, plan_ind_to_use):
     """

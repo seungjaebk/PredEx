@@ -63,9 +63,9 @@ def visualize_sensor_range(
         vis_rows, vis_cols = np.where(visible_in_range)
         occ_rows, occ_cols = np.where(occluded_mask)
         
-        # Plot
-        ax.scatter(vis_cols - pd_size, vis_rows - pd_size, c='cyan', s=1, alpha=0.05, label='Visible Area')
-        ax.scatter(occ_cols - pd_size, occ_rows - pd_size, c='orange', s=1, alpha=0.05, label='Occluded Area')
+        # Plot with updated colors (brighter cyan, less dense orange)
+        ax.scatter(vis_cols - pd_size, vis_rows - pd_size, c='#00E5FF', s=1, alpha=0.15, label='Visible')
+        ax.scatter(occ_cols - pd_size, occ_rows - pd_size, c='#FFA500', s=1, alpha=0.04, label='Occluded')
         
     except Exception as e:
         pass  # Silently handle visualization errors
@@ -141,25 +141,37 @@ def add_observation_legend(ax):
         Line2D([0], [0], color='cyan', lw=2, label='Flow Vec'),
         Line2D([0], [0], color='yellow', lw=2, label='Repulsion'),
         Line2D([0], [0], color='red', lw=2, label='Combined Vel'),
-        Line2D([0], [0], marker='o', color='w', label='Visible', markerfacecolor='cyan', markersize=5, alpha=0.5),
-        Line2D([0], [0], marker='o', color='w', label='Occluded', markerfacecolor='orange', markersize=5, alpha=0.5),
+        Line2D([0], [0], marker='o', color='w', label='Visible', markerfacecolor='#00E5FF', markersize=5, alpha=0.5),
+        Line2D([0], [0], marker='o', color='w', label='Occluded', markerfacecolor='#FFA500', markersize=5, alpha=0.5),
     ]
     ax.legend(handles=legend_elements, loc='upper right', fontsize='small')
 
 
-def create_figure_layout(mode='nbh'):
+def create_figure_layout(mode='nbh', use_astar=False):
     """
     Create figure layout for exploration visualization.
     
     Args:
         mode: Exploration mode
+        use_astar: Whether using A* for local planning (2x2 layout)
         
     Returns:
         fig: Matplotlib figure
         axes: Dictionary of axes
     """
-    if mode == 'nbh':
-        fig, ax_array = plt.subplots(3, 2, figsize=(12, 14))
+    if mode == 'nbh' and use_astar:
+        # A* mode: 2x2 grid
+        fig, ax_array = plt.subplots(2, 2, figsize=(16, 12))
+        ax_flatten = ax_array.flatten()
+        axes = {
+            'gt': ax_flatten[0],
+            'gt_graph': ax_flatten[1],
+            'obs': ax_flatten[2],
+            'mean': ax_flatten[3],
+        }
+    elif mode == 'nbh':
+        # Flow mode: 3x2 grid
+        fig, ax_array = plt.subplots(3, 2, figsize=(20, 15))
         ax_flatten = ax_array.flatten()
         axes = {
             'gt': ax_flatten[0],
@@ -195,5 +207,5 @@ def save_visualization(fig, save_path, step_idx, exp_title):
     import os
     filename = f"{exp_title}_{step_idx:08d}.png"
     filepath = os.path.join(save_path, filename)
-    fig.savefig(filepath, dpi=100, bbox_inches='tight')
+    fig.savefig(filepath, dpi=300, bbox_inches='tight')
     print(f"saving fig: {step_idx}")

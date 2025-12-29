@@ -84,6 +84,37 @@ def dummy_context_manager():
     yield None
 
 
+def align_pred_map(pred_map, obs_shape, fill_value):
+    if pred_map is None:
+        return None
+    pred_h, pred_w = pred_map.shape
+    obs_h, obs_w = obs_shape
+    aligned = np.full((obs_h, obs_w), fill_value, dtype=pred_map.dtype)
+
+    if pred_h >= obs_h:
+        src_top = (pred_h - obs_h) // 2
+        dst_top = 0
+        copy_h = obs_h
+    else:
+        src_top = 0
+        dst_top = (obs_h - pred_h) // 2
+        copy_h = pred_h
+
+    if pred_w >= obs_w:
+        src_left = (pred_w - obs_w) // 2
+        dst_left = 0
+        copy_w = obs_w
+    else:
+        src_left = 0
+        dst_left = (obs_w - pred_w) // 2
+        copy_w = pred_w
+
+    aligned[dst_top:dst_top+copy_h, dst_left:dst_left+copy_w] = pred_map[
+        src_top:src_top+copy_h, src_left:src_left+copy_w
+    ]
+    return aligned
+
+
 def get_lama_pred_from_obs(cur_obs_img, lama_model, lama_map_transform, device):
     """Get LAMA model prediction from observation image."""
     cur_obs_img_3chan = np.stack([cur_obs_img, cur_obs_img, cur_obs_img], axis=2)
@@ -215,10 +246,11 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         if not os.path.exists(exp_dir):
             os.makedirs(exp_dir)
 
-        # Create subdirectory (global_obs, run_viz) and save paths
+        # Create subdirectory (global_obs, run_viz, graph_map) and save paths
         global_obs_dir = os.path.join(exp_dir, 'global_obs')
         run_viz_dir = os.path.join(exp_dir, 'run_viz')
-        for dir_path in [global_obs_dir, run_viz_dir]:
+        graph_map_dir = os.path.join(exp_dir, 'graph_map')
+        for dir_path in [global_obs_dir, run_viz_dir, graph_map_dir]:
             if not os.path.exists(dir_path):
                 os.makedirs(dir_path)
         gt_map_save_path = os.path.join(exp_dir, 'gt_map.png')
@@ -242,16 +274,14 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
 
         # Visualization Setup 
         if mode in ['pipe', 'mapex', 'nbh']:
-            plt_row = 3
+            plt_row = 2
             plt_col = 2
-            fig, ax = plt.subplots(plt_row, plt_col, figsize=(20, 15))
+            fig, ax = plt.subplots(plt_row, plt_col, figsize=(16, 12))
             ax_flatten = ax.flatten()
             ax_gt = ax_flatten[0]
             ax_obs = ax_flatten[1]
-            ax_pred_var = ax_flatten[2]
-            ax_mean_map = ax_flatten[3]
-            ax_traj_dist = ax_flatten[4]  # NEW: Trajectory distribution
-            ax_cell_graph = ax_flatten[5]  # NEW: Cell graph
+            ax_mean_map = ax_flatten[2]
+            ax_cell_graph = ax_flatten[3]
             pred_maputils = None
             var_map = None
             mean_map = None
@@ -451,7 +481,10 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     locked_frontier_center = None  # Flow mode uses cell-based navigation, not locked frontier
 
                 # Local planning (flow mode only)
-                chosen_local_planner = determine_local_planner(mode)
+                if mode == 'nbh':
+                    chosen_local_planner = 'nbh'
+                else:
+                    chosen_local_planner = determine_local_planner(mode)
 
                 flow_obs_patch = None
                 flow_mean_patch = None
@@ -489,35 +522,22 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         next_pose = gradient_planner(cur_pose, cost_transform_map=cost_transform_map) 
                         cur_pose = next_pose
                 elif chosen_local_planner == 'nbh':
-                    if not use_flow_planner:
+                    if not use_flow_planner and not USE_ASTAR_FOR_LOCAL:
                         raise ValueError("Flow planner selected but flow model is not available")
                     
                     # --- GRAPH FLOW LOGIC ---
                     # Update Graph with current observation AND prediction (for Ghosts)
-                    # IMPORTANT: Crop prediction maps to match obs_map size (remove padding)
-                    # LAMA output is padded (pd_size=500) but mapper.obs_map is unpadded
-                    pd_size = 500
-                    unpadded_pred_mean = None
-                    unpadded_pred_var = None
-                    if latest_pred_mean_map is not None:
-                        h, w = mapper.obs_map.shape
-                        # Crop out the padding from prediction maps
-                        if latest_pred_mean_map.shape[0] > h:
-                            unpadded_pred_mean = latest_pred_mean_map[pd_size:pd_size+h, pd_size:pd_size+w]
-                        else:
-                            unpadded_pred_mean = latest_pred_mean_map
-                    if latest_pred_var_map is not None:
-                        h, w = mapper.obs_map.shape
-                        if latest_pred_var_map.shape[0] > h:
-                            unpadded_pred_var = latest_pred_var_map[pd_size:pd_size+h, pd_size:pd_size+w]
-                        else:
-                            unpadded_pred_var = latest_pred_var_map
+                    # Align prediction maps to obs_map size; pad unknown outside.
+                    obs_h, obs_w = mapper.obs_map.shape
+                    unpadded_pred_mean = align_pred_map(latest_pred_mean_map, (obs_h, obs_w), fill_value=0.5)
+                    unpadded_pred_var = align_pred_map(latest_pred_var_map, (obs_h, obs_w), fill_value=1.0)
                     
                     cell_manager.update_graph(
                         cur_pose, 
                         mapper.obs_map, 
                         unpadded_pred_mean, # Cropped to match obs_map coordinates
-                        pred_var_map=unpadded_pred_var  # Cropped to match obs_map coordinates
+                        pred_var_map=unpadded_pred_var,  # Cropped to match obs_map coordinates
+                        inflated_occ_grid=occ_grid_pyastar
                     )
                     
                     # Ensure we have latest prediction (updated in need_new_locked_frontier block)
@@ -538,7 +558,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     # This prevents the target from jumping around as the robot moves.
                     
                     goal_vec_np = np.zeros(2, dtype=np.float32)
-                    target_cell = None  # Will be set only when getting new target
+                    target_cell = locked_target_cell  # Preserve high-level target until reached/stale
                     
                     if current_waypoint is not None:
                         # We have an active waypoint - check if reached
@@ -580,11 +600,9 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                 locked_trajectory_samples = None
                                 waypoint_steps_counter = 0
                         else:
-                            # Waypoint Reached! Clear it so we get a new target below
+                            # Waypoint Reached! Clear only the waypoint; keep high-level target
                             print(f"Waypoint Reached! (dist={dist_to_next_wp:.2f}, path_remaining={remaining_cells if 'remaining_cells' in dir() else '?'} cells)")
                             current_waypoint = None
-                            locked_target_cell = None
-                            locked_path_to_target = None
                             locked_trajectory = None
                             locked_trajectory_samples = None
                             waypoint_steps_counter = 0
@@ -641,14 +659,22 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                 target_unreachable = True
                                 print(f"[HIGH-LEVEL] Target {target_cell.index} is now UNREACHABLE, selecting new target")
                         
-                        need_new_high_level_target = (
-                            target_cell is None or 
-                            target_cell.is_blocked or
-                            target_cell.index == cell_manager.current_cell.index or  # Reached target cell
-                            target_unreachable  # Path to target is now blocked
-                        )
+                        target_change_reasons = []
+                        if target_cell is None:
+                            target_change_reasons.append("none")
+                        elif target_cell.is_blocked:
+                            target_change_reasons.append("blocked")
+                        if target_cell is not None and cell_manager.current_cell is not None:
+                            if target_cell.index == cell_manager.current_cell.index:
+                                target_change_reasons.append("reached")
+                        if target_unreachable:
+                            target_change_reasons.append("unreachable")
+
+                        need_new_high_level_target = len(target_change_reasons) > 0
                         
                         if need_new_high_level_target:
+                            reasons_str = ", ".join(target_change_reasons)
+                            print(f"[HIGH-LEVEL] Reselecting target (reason: {reasons_str})")
                             # Find best ghost cell (highest uncertainty) that is REACHABLE from current cell
                             exploration_target = cell_manager.find_exploration_target(
                                 latest_pred_var_map if latest_pred_var_map is not None else np.zeros_like(mapper.obs_map),
@@ -716,25 +742,26 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             flow_tensor_sample, flow_goal_tensor_sample = build_flow_input_tensor(
                                 flow_obs_patch, flow_mean_patch, flow_var_patch, goal_vec_for_sampling
                             )
-                            if flow_tensor_sample is not None:
+                            if flow_tensor_sample is not None and use_flow_planner:
                                 from nbh.flow_viz_utils import sample_multiple_trajectories, select_best_trajectory
-                                
+
                                 locked_trajectory_samples = sample_multiple_trajectories(
                                     flow_model, flow_tensor_sample, flow_goal_tensor_sample, flow_device,
                                     num_samples=50, num_steps=flow_num_steps, delta_scale=DELTA_SCALE,
                                     goal_perturb_std=0.5  # ~30° spread
                                 )
-                                
+
                                 # Select best trajectory (collision-free, in corridor, closest to goal)
                                 # Pass path_to_target as "fence" constraint
                                 locked_trajectory, best_idx, collision_free_count = select_best_trajectory(
                                     locked_trajectory_samples, cur_pose, padded_obs_map, goal_vec_for_sampling,
                                     path_cells=path_to_target, cell_size=CELL_SIZE
                                 )
-                                
+
                                 sampled_trajectories = locked_trajectory_samples  # For visualization
                                 print(f"  → Sampled {len(locked_trajectory_samples)} trajectories, {collision_free_count} free, selected idx={best_idx}")
                             else:
+                                locked_trajectory_samples = None
                                 locked_trajectory = goal_vec_for_sampling * DELTA_SCALE  # Fallback: direct
                             
                             # Print graph-based distance
@@ -768,7 +795,10 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         target_xy_global = np.array([tp_c - pd_size, tp_r - pd_size])
                         pose_xy_global = np.array([cp_c - pd_size, cp_r - pd_size])
                         
-                        print(f"Target Cell Center (Locked): {target_xy_global}, Current Pose: {pose_xy_global}, Vector: {goal_vec_np}")
+                        if not USE_ASTAR_FOR_LOCAL:
+                            print(f"Target Cell Center (Locked): {target_xy_global}, Current Pose: {pose_xy_global}, Vector: {goal_vec_np}")
+                        else:
+                            print(f"Target Cell Center (Locked): {target_xy_global}, Current Pose: {pose_xy_global}")
                     
                         
                         # print(f"Graph Decision: {decision_type} -> Cell{target_cell.index}")
@@ -810,8 +840,9 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             path = None
                         
                         # Skip flow/repulsion/slide logic - A* handles everything
-                        plan_x = np.array([cur_pose[0], next_pose[0]])
-                        plan_y = np.array([cur_pose[1], next_pose[1]])
+                        if astar_path is None or len(astar_path) <= 1:
+                            plan_x = np.array([cur_pose[0], next_pose[0]])
+                            plan_y = np.array([cur_pose[1], next_pose[1]])
                         
                     else:
                         # ========== FLOW LOCAL PLANNER (production mode) ==========
@@ -1096,138 +1127,125 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         except Exception:
                             pass
 
-                        # Scale up for visibility
-                        viz_scale = 10 
-                        
-                        # 1. Plot Raw Flow (Cyan) - Where the brain wants to go
-                        if 'delta_norm' in locals():
-                            d_raw = delta_norm * 3.0 # Scale to match step size
-                            ax_obs.arrow(cur_pose[1]-pd_size, cur_pose[0]-pd_size, 
-                                         d_raw[1]*viz_scale, d_raw[0]*viz_scale, 
-                                         color='cyan', head_width=3, label='Flow Vec')
+                        if not USE_ASTAR_FOR_LOCAL:
+                            # Scale up for visibility
+                            viz_scale = 10 
+                            
+                            # 1. Plot Raw Flow (Cyan) - Where the brain wants to go
+                            if 'delta_norm' in locals():
+                                d_raw = delta_norm * 3.0 # Scale to match step size
+                                ax_obs.arrow(cur_pose[1]-pd_size, cur_pose[0]-pd_size, 
+                                             d_raw[1]*viz_scale, d_raw[0]*viz_scale, 
+                                             color='cyan', head_width=3, label='Flow Vec')
 
-                        # 2. Plot Repulsion (Yellow) - Where walls push
-                        if 'repulsive_force' in locals() and np.linalg.norm(repulsive_force) > 0.1:
-                            d_rep = repulsive_force * 3.0
-                            ax_obs.arrow(cur_pose[1]-pd_size, cur_pose[0]-pd_size, 
-                                         d_rep[1]*viz_scale, d_rep[0]*viz_scale, 
-                                         color='yellow', head_width=3, label='Repulsion')
+                            # 2. Plot Repulsion (Yellow) - Where walls push
+                            if 'repulsive_force' in locals() and np.linalg.norm(repulsive_force) > 0.1:
+                                d_rep = repulsive_force * 3.0
+                                ax_obs.arrow(cur_pose[1]-pd_size, cur_pose[0]-pd_size, 
+                                             d_rep[1]*viz_scale, d_rep[0]*viz_scale, 
+                                             color='yellow', head_width=3, label='Repulsion')
 
-                        # 3. Plot Final Result (Red/Orange) - Actual movement
-                        d_row, d_col = delta_pixels[0] * viz_scale, delta_pixels[1] * viz_scale
-                        ax_obs.arrow(cur_pose[1]-pd_size, cur_pose[0]-pd_size, d_col, d_row, color='red', head_width=5, label='Combined Vel')
-                        
-                        # Add Legend
-                        from matplotlib.lines import Line2D
-                        legend_elements = [
-                            Line2D([0], [0], marker='o', color='w', label='Target Cell', markerfacecolor='blue', markersize=8),
-                            Line2D([0], [0], color='cyan', lw=2, label='Flow Vec'),
-                            Line2D([0], [0], color='yellow', lw=2, label='Repulsion'),
-                            Line2D([0], [0], color='red', lw=2, label='Combined Vel'),
-                            Line2D([0], [0], marker='o', color='w', label='Visible', markerfacecolor='cyan', markersize=5, alpha=0.5),
-                            Line2D([0], [0], marker='o', color='w', label='Occluded', markerfacecolor='orange', markersize=5, alpha=0.5),
-                        ]
-                        ax_obs.legend(handles=legend_elements, loc='upper right', fontsize='small')
+                            # 3. Plot Final Result (Red/Orange) - Actual movement
+                            d_row, d_col = delta_pixels[0] * viz_scale, delta_pixels[1] * viz_scale
+                            ax_obs.arrow(cur_pose[1]-pd_size, cur_pose[0]-pd_size, d_col, d_row, color='red', head_width=5, label='Combined Vel')
+                            
+                            # Add Legend (Flow mode)
+                            from matplotlib.lines import Line2D
+                            legend_elements = [
+                                Line2D([0], [0], marker='o', color='w', label='Target Cell', markerfacecolor='blue', markersize=8),
+                                Line2D([0], [0], color='cyan', lw=2, label='Flow Vec'),
+                                Line2D([0], [0], color='yellow', lw=2, label='Repulsion'),
+                                Line2D([0], [0], color='red', lw=2, label='Combined Vel'),
+                                Line2D([0], [0], marker='o', color='w', label='Visible', markerfacecolor='cyan', markersize=5, alpha=0.5),
+                                Line2D([0], [0], marker='o', color='w', label='Occluded', markerfacecolor='orange', markersize=5, alpha=0.5),
+                            ]
+                            ax_obs.legend(handles=legend_elements, loc='upper right', fontsize='small')
+                        else:
+                            # Add Legend (A* debug mode)
+                            from matplotlib.lines import Line2D
+                            legend_elements = [
+                                Line2D([0], [0], marker='o', color='w', label='Target Cell', markerfacecolor='blue', markersize=8),
+                                Line2D([0], [0], color='#eb4205', lw=2, linestyle=':', label='A* Path'),
+                                Line2D([0], [0], marker='o', color='w', label='Visible', markerfacecolor='cyan', markersize=5, alpha=0.5),
+                                Line2D([0], [0], marker='o', color='w', label='Occluded', markerfacecolor='orange', markersize=5, alpha=0.5),
+                            ]
+                            ax_obs.legend(handles=legend_elements, loc='upper right', fontsize='small')
                         
                     ax_obs.set_title('Observed Map')
 
-                    if pred_maputils is not None:
+                    if pred_maputils is not None and mean_map is not None:
                         white = "#FFFFFF"
                         blue = "#0000FF"
-                        colors = [white, blue]
-                        n_bins = 10
-                        cmap = LinearSegmentedColormap.from_list("customwhiteblue", colors, N=n_bins)
-                        
-                        if mode not in ['hectoraug']: # Hector aug does not have variance
-                            orange = "#FF9F1C"
+                        orange = "#FF9F1C"
+                        if mode == 'pipe':
                             colors = [white, orange]
-                            n_bins = 10
-                            var_cmap = LinearSegmentedColormap.from_list("custom_green_var", colors, N=n_bins)
-                            ax_pred_var.imshow(var_map[pd_size+pad_w1:-(pd_size+pad_w2),pd_size+pad_h1:-(pd_size+pad_h2)].cpu().numpy(), vmin=0, vmax=0.3, cmap=var_cmap)
-                            ax_pred_var.set_title('Predicted Map Variance')
-                            
-                            # for model_i in range(len(models_list)):
-                            #     ax_pred_lama_list[model_i].imshow(lama_pred_list[model_i].cpu().numpy())
-                            #     ax_pred_lama_list[model_i].set_title('LAMA {}'.format(model_i))                
-                            #ax_reduced_var.imshow(lama_reduced_pred_var[pd_size+pad_w1:-(pd_size+pad_w2),pd_size+pad_h1:-(pd_size+pad_h2)].cpu().numpy(), vmin=0, vmax=0.3)
-                            #ax_reduced_var.set_title('LAMA Variance (reduced)')
+                        else:
+                            colors = [white, blue]
+                        n_bins = 100
+                        cmap = LinearSegmentedColormap.from_list("customgreenred", colors, N=n_bins)
+                        ax_mean_map.imshow(mean_map[pd_size:-(pd_size),pd_size:-(pd_size)],cmap=cmap) #predicted map
 
-                            if mean_map is not None:
-                                white = "#FFFFFF"
-                                #black = "#000000"
-                                #green = "#b0f542"
-                                #red = "#ed0c0c"
-                                blue = "#0000FF"
-                                orange = "#FF9F1C"
-                                if mode == 'pipe':
-                                    colors = [white, orange]
-                                else:
-                                    colors = [white, blue]
-                                n_bins = 100
-                                cmap = LinearSegmentedColormap.from_list("customgreenred", colors, N=n_bins)
-                                ax_mean_map.imshow(mean_map[pd_size:-(pd_size),pd_size:-(pd_size)],cmap=cmap) #predicted map
+                        #overlay observed(known) occupied cells on top of the predicted map
+                        obs_occ_mask = np.zeros_like(mean_map[pd_size:-(pd_size),pd_size:-(pd_size)])
+                        occupied_indices_in_obsmap = np.where(mapper.obs_map[pd_size-pad_h1:-(pd_size-pad_h2),pd_size-pad_w1:-(pd_size-pad_w2)] == 1.0) #indices where obs_map is occupied
+                        obs_occ_mask[occupied_indices_in_obsmap] = 1
+                        obs_occ_mask_colors = ["#000000","#000000"]
+                        obs_occ_mask_cmap = LinearSegmentedColormap.from_list("mask_black",obs_occ_mask_colors,N=2)
+                        obs_occ_mask_alpha = np.zeros_like(obs_occ_mask, dtype=float)
+                        obs_occ_mask_alpha[obs_occ_mask==1] = 1.0
+                        obs_occ_mask_alpha[obs_occ_mask==0] = 0.0
+                        ax_mean_map.imshow(obs_occ_mask, cmap=obs_occ_mask_cmap, alpha=obs_occ_mask_alpha) #obs_map known occ cells -> black
 
-                                #overlay observed(known) occupied cells on top of the predicted map
-                                obs_occ_mask = np.zeros_like(mean_map[pd_size:-(pd_size),pd_size:-(pd_size)])
-                                occupied_indices_in_obsmap = np.where(mapper.obs_map[pd_size-pad_h1:-(pd_size-pad_h2),pd_size-pad_w1:-(pd_size-pad_w2)] == 1.0) #indices where obs_map is occupied
-                                obs_occ_mask[occupied_indices_in_obsmap] = 1
-                                obs_occ_mask_colors = ["#000000","#000000"]
-                                obs_occ_mask_cmap = LinearSegmentedColormap.from_list("mask_black",obs_occ_mask_colors,N=2)
-                                obs_occ_mask_alpha = np.zeros_like(obs_occ_mask, dtype=float)
-                                obs_occ_mask_alpha[obs_occ_mask==1] = 1.0
-                                obs_occ_mask_alpha[obs_occ_mask==0] = 0.0
-                                ax_mean_map.imshow(obs_occ_mask, cmap=obs_occ_mask_cmap, alpha=obs_occ_mask_alpha) #obs_map known occ cells -> black
-
-                                #overlay unknown(obs_map) cells as gray tint
-                                obs_unk_mask = np.zeros_like(mean_map[pd_size:-pd_size,pd_size:-pd_size])
-                                unknown_indices_in_obs_map = np.where(mapper.obs_map[pd_size-pad_h1:-(pd_size-pad_h2),pd_size-pad_w1:-(pd_size-pad_w2)] == 0.5) #indices of unknown cells in obs_map
-                                obs_unk_mask[unknown_indices_in_obs_map] = 1
-                                grey = "#909090" #tunable grey value
-                                obs_unk_mask_colors = [grey,grey]
-                                obs_unk_mask_cmap = LinearSegmentedColormap.from_list("mask_grey", obs_unk_mask_colors, N=2)
-                                obs_unk_mask_alpha = np.zeros_like(obs_unk_mask, dtype=float)
-                                obs_unk_mask_alpha[obs_unk_mask==1] = 0.3 #tunable opacity for grey unknown area
-                                obs_unk_mask_alpha[obs_unk_mask==0] = 0.0
-                                ax_mean_map.imshow(obs_unk_mask, cmap=obs_unk_mask_cmap, alpha=obs_unk_mask_alpha)
+                        #overlay unknown(obs_map) cells as gray tint
+                        obs_unk_mask = np.zeros_like(mean_map[pd_size:-pd_size,pd_size:-pd_size])
+                        unknown_indices_in_obs_map = np.where(mapper.obs_map[pd_size-pad_h1:-(pd_size-pad_h2),pd_size-pad_w1:-(pd_size-pad_w2)] == 0.5) #indices of unknown cells in obs_map
+                        obs_unk_mask[unknown_indices_in_obs_map] = 1
+                        grey = "#909090" #tunable grey value
+                        obs_unk_mask_colors = [grey,grey]
+                        obs_unk_mask_cmap = LinearSegmentedColormap.from_list("mask_grey", obs_unk_mask_colors, N=2)
+                        obs_unk_mask_alpha = np.zeros_like(obs_unk_mask, dtype=float)
+                        obs_unk_mask_alpha[obs_unk_mask==1] = 0.3 #tunable opacity for grey unknown area
+                        obs_unk_mask_alpha[obs_unk_mask==0] = 0.0
+                        ax_mean_map.imshow(obs_unk_mask, cmap=obs_unk_mask_cmap, alpha=obs_unk_mask_alpha)
                                 
-                                #path_color = "#417CF2" #blue
-                                path_color = "#eb4205" #coral(red)
-                                if pose_list is not None:
-                                    ax_mean_map.plot(pose_list[:, 1]-(pd_size-pad_w1), pose_list[:, 0]-(pd_size-pad_h1), c=path_color, alpha=1.0)
-                                    #ax_mean_map.scatter(pose_list[-1, 1]-(pd_size-pad_w1), pose_list[-1, 0]-(pd_size-pad_h1), c='g', s=10, marker='*')
-                                if mode not in ['upen', 'hector', 'hectoraug'] and locked_frontier_center is not None: # UPEN and Hector do not have locked frontiers
-                                    ax_mean_map.scatter(locked_frontier_center[1]-(pd_size-pad_w1), locked_frontier_center[0]-(pd_size-pad_h1), c='#eb4205', s=10)
-                                #ax_mean_map.scatter(cur_pose[1]-(pd_size-pad_w1), cur_pose[0]-(pd_size-pad_h1), c='r', s=5, marker='x')
-                                #ax_mean_map.scatter(next_pose[1]-(pd_size-pad_w1), next_pose[0]-(pd_size-pad_h1), c='g', s=5, marker='x')
-                                if mode not in ['hector', 'hectoraug']: # Hector does not have path planning
-                                    ax_mean_map.plot(plan_y-(pd_size-pad_w1), plan_x-(pd_size-pad_h1), c='#eb4205', linestyle=':')
-                                ax_mean_map.set_title('Mean Map of Prediction Ensembles')
+                        #path_color = "#417CF2" #blue
+                        path_color = "#eb4205" #coral(red)
+                        if pose_list is not None:
+                            ax_mean_map.plot(pose_list[:, 1]-(pd_size-pad_w1), pose_list[:, 0]-(pd_size-pad_h1), c=path_color, alpha=1.0)
+                            #ax_mean_map.scatter(pose_list[-1, 1]-(pd_size-pad_w1), pose_list[-1, 0]-(pd_size-pad_h1), c='g', s=10, marker='*')
+                        if mode not in ['upen', 'hector', 'hectoraug'] and locked_frontier_center is not None: # UPEN and Hector do not have locked frontiers
+                            ax_mean_map.scatter(locked_frontier_center[1]-(pd_size-pad_w1), locked_frontier_center[0]-(pd_size-pad_h1), c='#eb4205', s=10)
+                        #ax_mean_map.scatter(cur_pose[1]-(pd_size-pad_w1), cur_pose[0]-(pd_size-pad_h1), c='r', s=5, marker='x')
+                        #ax_mean_map.scatter(next_pose[1]-(pd_size-pad_w1), next_pose[0]-(pd_size-pad_h1), c='g', s=5, marker='x')
+                        if mode not in ['hector', 'hectoraug']: # Hector does not have path planning
+                            ax_mean_map.plot(plan_y-(pd_size-pad_w1), plan_x-(pd_size-pad_h1), c='#eb4205', linestyle=':')
+                        ax_mean_map.set_title('Mean Map of Prediction Ensembles')
 
-                                #visualize frontiers on the mean_map
-                                #if frontier_cost_list is not None and np.all(frontier_cost_list == 0):
-                                #    frontier_colors = 'r'
-                                #else:
-                                #    frontier_colors = -frontier_cost_list
-                                #ax_mean_map.scatter(np.array(frontier_region_centers)[:, 1]-(pd_size-pad_w1), np.array(frontier_region_centers)[:, 0]-(pd_size-pad_h1), c=frontier_colors, s=15, marker='x',cmap='plasma')
+                        #visualize frontiers on the mean_map
+                        #if frontier_cost_list is not None and np.all(frontier_cost_list == 0):
+                        #    frontier_colors = 'r'
+                        #else:
+                        #    frontier_colors = -frontier_cost_list
+                        #ax_mean_map.scatter(np.array(frontier_region_centers)[:, 1]-(pd_size-pad_w1), np.array(frontier_region_centers)[:, 0]-(pd_size-pad_h1), c=frontier_colors, s=15, marker='x',cmap='plasma')
 
-                                if mode != 'upen':
-                                    if viz_most_flooded_grid is not None:
-                                        most_flooded_grid = viz_most_flooded_grid#[pd_size:-pd_size,pd_size:-pd_size]
-                                        flooded_ind = np.where(most_flooded_grid==True)
-                                        flooded_ind_colors_alpha = np.zeros((mean_map.shape[0],mean_map.shape[1],4))
-                                        if mode == 'pipe':
-                                            flooded_ind_colors_alpha[flooded_ind[0],flooded_ind[1],:] = (0, 0, 1, 0.15) #blue color for visibility mask
-                                        else:
-                                            flooded_ind_colors_alpha[flooded_ind[0],flooded_ind[1],:] = (255/255,159/255,28/255,0.3) #orange color for visibility mask
-                                        ax_mean_map.imshow(flooded_ind_colors_alpha[pd_size:-pd_size,pd_size:-pd_size])
-                                    if viz_medium_flooded_grid is not None:
-                                        medium_flooded_ind = np.where(viz_medium_flooded_grid == True)
-                                        medium_flooded_ind_colors_alpha = np.zeros((mean_map.shape[0],mean_map.shape[1],4))
-                                        #medium_flooded_ind_colors_alpha[medium_flooded_ind[0], medium_flooded_ind[1],:] = (154/255,230/255,72/255,0.4)
-                                        medium_flooded_ind_colors_alpha[medium_flooded_ind[0], medium_flooded_ind[1],:] = (207/255,3/255,252/255,0.25)
-                                        #ax_mean_map.imshow(medium_flooded_ind_colors_alpha[pd_size:-pd_size,pd_size:-pd_size])
-                                        #if medium_ind is not None:
-                                        #    ax_mean_map.scatter(frontier_region_centers[medium_ind,1]-(pd_size-pad_w1), frontier_region_centers[medium_ind,0]-(pd_size-pad_h1), c='#390ccc',s=10)
+                        if mode != 'upen':
+                            if viz_most_flooded_grid is not None:
+                                most_flooded_grid = viz_most_flooded_grid#[pd_size:-pd_size,pd_size:-pd_size]
+                                flooded_ind = np.where(most_flooded_grid==True)
+                                flooded_ind_colors_alpha = np.zeros((mean_map.shape[0],mean_map.shape[1],4))
+                                if mode == 'pipe':
+                                    flooded_ind_colors_alpha[flooded_ind[0],flooded_ind[1],:] = (0, 0, 1, 0.15) #blue color for visibility mask
+                                else:
+                                    flooded_ind_colors_alpha[flooded_ind[0],flooded_ind[1],:] = (255/255,159/255,28/255,0.3) #orange color for visibility mask
+                                ax_mean_map.imshow(flooded_ind_colors_alpha[pd_size:-pd_size,pd_size:-pd_size])
+                            if viz_medium_flooded_grid is not None:
+                                medium_flooded_ind = np.where(viz_medium_flooded_grid == True)
+                                medium_flooded_ind_colors_alpha = np.zeros((mean_map.shape[0],mean_map.shape[1],4))
+                                #medium_flooded_ind_colors_alpha[medium_flooded_ind[0], medium_flooded_ind[1],:] = (154/255,230/255,72/255,0.4)
+                                medium_flooded_ind_colors_alpha[medium_flooded_ind[0], medium_flooded_ind[1],:] = (207/255,3/255,252/255,0.25)
+                                #ax_mean_map.imshow(medium_flooded_ind_colors_alpha[pd_size:-pd_size,pd_size:-pd_size])
+                                #if medium_ind is not None:
+                                #    ax_mean_map.scatter(frontier_region_centers[medium_ind,1]-(pd_size-pad_w1), frontier_region_centers[medium_ind,0]-(pd_size-pad_h1), c='#390ccc',s=10)
 
                     if mode in ['hector', 'hectoraug']:
                         ax_mean_map.imshow(cost_transform_map[pd_size:-pd_size,pd_size:-pd_size], cmap='gray')
@@ -1240,29 +1258,14 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     #     ax_max_flooded_grid.imshow(viz_most_flooded_grid)
                     #     ax_max_flooded_grid.set_title('Most Frontier Val')
 
-                    # --- NEW: Trajectory Distribution Visualization ---
-                    if mode == 'nbh' and 'ax_traj_dist' in dir():
-                        ax_traj_dist.clear()
-                        # Show obs map as background (inverted: free=white)
-                        display_obs = padded_obs_map[pd_size:-pd_size, pd_size:-pd_size]
-                        ax_traj_dist.imshow(1 - display_obs, cmap='gray', vmin=0, vmax=1)  # Invert!
-                        if sampled_trajectories is not None and len(sampled_trajectories) > 0:
-                            visualize_trajectory_distribution(
-                                ax_traj_dist, cur_pose, sampled_trajectories,
-                                goal_pose=locked_frontier_center,
-                                patch_offset=np.array([pd_size, pd_size]),
-                                obs_map=padded_obs_map  # Added for collision coloring
-                            )
-                        else:
-                            ax_traj_dist.set_title('Trajectory Distribution (No samples)')
-                    
                     # --- NEW: Cell Graph Visualization ---
                     if mode == 'nbh' and 'ax_cell_graph' in dir() and cell_manager is not None:
                         ax_cell_graph.clear()
                         visualize_cell_graph(
                             ax_cell_graph, cell_manager, padded_obs_map, mean_map,
                             current_pose=cur_pose, target_cell=target_cell, 
-                            path_to_target=path_to_target, pd_size=pd_size
+                            path_to_target=path_to_target, pd_size=pd_size,
+                            show_cell_boundaries=True
                         )
 
                     plt.tight_layout()
@@ -1276,6 +1279,29 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     # import pdb; pdb.set_trace() 
                     # print("4. Visualizing took {} seconds".format(np.round(time.time() - start_time, 2)))
                     #plt.close()
+
+                    # Save detailed graph visualization with scores (baseline-style)
+                    if mode == 'nbh' and cell_manager is not None and show_plt:
+                        fig_graph, ax_graph = plt.subplots(1, 1, figsize=(10, 10))
+                        ax_graph.imshow(1-mapper.gt_map[pd_size:-pd_size,pd_size:-pd_size], cmap='gray', vmin=0, vmax=1)
+                        visualize_cell_graph(
+                            ax_graph, cell_manager, padded_gt_map, mean_map,
+                            current_pose=cur_pose, target_cell=target_cell,
+                            path_to_target=path_to_target, pd_size=pd_size,
+                            overlay_mode=True,
+                            show_scores=True,
+                            start_cell=None,
+                            astar_path=astar_path if 'astar_path' in locals() else None,
+                            show_cell_boundaries=True
+                        )
+                        ax_graph.scatter(cur_pose[1] - pd_size, cur_pose[0] - pd_size, c='lime', s=30, marker='*',
+                                         zorder=20, edgecolors='black', linewidths=0.5)
+                        scores = [n.propagated_value for n in cell_manager.cells.values() if n.propagated_value > 0]
+                        min_score = min(scores) if scores else 0.0
+                        max_score = max(scores) if scores else 0.0
+                        ax_graph.set_title(f'Detailed Cell Graph (Scores: {min_score:.2f}-{max_score:.2f})')
+                        plt.savefig(graph_map_dir + f'/graph_{str(t).zfill(8)}.png', dpi=300)
+                        plt.close(fig_graph)
 
                     
                     show_plt = False
@@ -1359,9 +1385,9 @@ if __name__ == '__main__':
     parser.add_argument('--cell_size', type=int, help='Cell size in pixels (default: 25 = 2.5m)')
     args = parser.parse_args()
     
-    # Auto-detect root path (PIPE directory is parent of parent of scripts/graph_flow)
+    # Auto-detect root path (nbh repo root is parent of nbh/)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    root_path = os.path.dirname(os.path.dirname(script_dir))
+    root_path = os.path.dirname(script_dir)
     
     collect_opts = get_options_dict_from_yml(data_collect_config_name)
     collect_opts.root_path = root_path  # Set root_path dynamically
@@ -1481,4 +1507,3 @@ if __name__ == '__main__':
     
     for run_exploration_arg in run_exploration_args:
         run_exploration_comparison_for_map(run_exploration_arg)
-

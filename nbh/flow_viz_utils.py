@@ -344,7 +344,9 @@ def visualize_trajectory_distribution(ax, cur_pose, trajectories, goal_pose=None
 
 def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
                           current_pose=None, target_cell=None, 
-                          path_to_target=None, show_edges=True, pd_size=500):
+                          path_to_target=None, show_edges=True, pd_size=500,
+                          overlay_mode=False, start_cell=None, astar_path=None, show_scores=False,
+                          show_cell_boundaries=False):
     """
     Visualize the cell graph with Real (observed) and Ghost (hallucinated) nodes.
     
@@ -358,8 +360,13 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
         path_to_target: list of CellNodes representing path from current to target
         show_edges: whether to draw edges between connected cells
         pd_size: padding size to subtract for visualization
+        overlay_mode: if True, don't draw background map (assumes already drawn)
+        start_cell: start cell when target was locked (shown with red diamond)
+        astar_path: A* local path to visualize (numpy array of [row, col] coordinates)
+        show_scores: whether to show node scores as text labels
+        show_cell_boundaries: draw dashed cell boundaries
     """
-    if obs_map is not None:
+    if not overlay_mode and obs_map is not None:
         # Show map as background (subtract padding for visualization)
         # Invert colormap: 0=free→white, 1=occupied→black
         h, w = obs_map.shape
@@ -382,6 +389,29 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
             ghost_nodes.append((center, cell))
         else:
             real_nodes.append((center, cell))
+
+    # Draw cell boundaries (mild dashed grid) for displayed cells
+    if show_cell_boundaries:
+        half = cell_manager.cell_size / 2.0
+        for _, cell in cell_manager.cells.items():
+            if cell.is_blocked:
+                continue
+            center = cell.center - pd_size
+            if center[0] < 0 or center[1] < 0:
+                continue
+            top = float(center[0] - half)
+            left = float(center[1] - half)
+            rect = mpatches.Rectangle(
+                (left, top),  # (x, y)
+                cell_manager.cell_size,
+                cell_manager.cell_size,
+                fill=False,
+                edgecolor=(0.4, 0.4, 0.4, 0.25),
+                linewidth=0.6,
+                linestyle=(0, (3, 3)),
+                zorder=2,
+            )
+            ax.add_patch(rect)
     
     # Draw edges first (so nodes appear on top)
     if show_edges:
@@ -418,19 +448,19 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
                                linewidths=1.0, linestyles='dashed')
             ax.add_collection(lc)
     
-    # Draw nodes
+    # Draw nodes (smaller icons)
     if real_nodes:
         real_centers = np.array([n[0] for n in real_nodes])
         ax.scatter(real_centers[:, 1], real_centers[:, 0], 
-                   c='blue', s=30, marker='s', alpha=0.7, label='Real Cells')
+                   c='blue', s=18, marker='s', alpha=0.7, label='Real Cells')
     
     if ghost_nodes:
         ghost_centers = np.array([n[0] for n in ghost_nodes])
         # Color by propagated value (uncertainty flow)
         values = [n[1].propagated_value for n in ghost_nodes]
         scatter = ax.scatter(ghost_centers[:, 1], ghost_centers[:, 0],
-                            c=values, cmap='Oranges', s=40, marker='o', 
-                            alpha=0.8, edgecolors='orange', linewidths=1,
+                            c=values, cmap='Oranges', s=25, marker='o', 
+                            alpha=0.8, edgecolors='orange', linewidths=0.8,
                             label='Ghost Cells', vmin=0)
     
     # Only show blocked nodes that have been actively explored (have neighbors)
@@ -443,27 +473,56 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
             ax.scatter(blocked_centers[:, 1], blocked_centers[:, 0],
                        c='red', s=20, marker='x', alpha=0.5, label='Blocked')
     
-    # Highlight current cell
+    # Highlight current cell (red diamond, smaller)
     if current_pose is not None:
         cur_cell_idx = cell_manager.get_cell_index(current_pose)
-        cur_cell = cell_manager.get_cell(cur_cell_idx, create_if_missing=False)
+        cur_cell = cell_manager.get_cell(cur_cell_idx)
         if cur_cell is not None:
             center = cur_cell.center - pd_size
-            ax.scatter([center[1]], [center[0]], c='cyan', s=200, marker='*',
-                       zorder=10, label='Current Cell')
+            ax.scatter([center[1]], [center[0]], c='red', s=80, marker='D',
+                       zorder=10, label='Current Cell', edgecolors='black', linewidths=0.5)
     
-    # Highlight target cell (no border, just marker)
+    # Highlight target cell (diamond shape, transparent inner, lime border)
     if target_cell is not None:
         center = target_cell.center - pd_size
-        ax.scatter([center[1]], [center[0]], c='lime', s=200, marker='P',
+        ax.scatter([center[1]], [center[0]], marker='D', s=120,
+                   facecolors='none', edgecolors='lime', linewidths=2.0,
                    zorder=10, label='Target Cell')
     
-    # Highlight path from current cell to target (red line only, no rectangles)
+    # Highlight start cell (red diamond, same size as target)
+    if start_cell is not None:
+        center = start_cell.center - pd_size
+        ax.scatter([center[1]], [center[0]], marker='D', s=120,
+                   facecolors='none', edgecolors='red', linewidths=2.0,
+                   zorder=10, label='Start Cell')
+    
+    # Highlight path from current cell to target (magenta dashed line)
     if path_to_target is not None and len(path_to_target) > 1:
-        # Draw thick red path line connecting cell centers
+        # Draw thick magenta dashed path line connecting cell centers
         path_centers = np.array([c.center - pd_size for c in path_to_target])
         ax.plot(path_centers[:, 1], path_centers[:, 0], 
-               'r-', linewidth=3.5, alpha=0.9, label='Planned Path', zorder=8)
+               color='#FF00FF', linestyle='--', linewidth=2.5, 
+               alpha=0.9, label='BFS Path', zorder=8)
+    
+    # Highlight A* local path (red solid line)
+    if astar_path is not None and len(astar_path) > 1:
+        # A* path is in (row, col) format, convert to display coordinates
+        astar_display = astar_path - pd_size
+        ax.plot(astar_display[:, 1], astar_display[:, 0],
+               'r-', linewidth=2.0, alpha=0.8, label='A* Path', zorder=9)
+    
+    # Show node scores as text labels (for debugging)
+    if show_scores:
+        for idx, cell in cell_manager.cells.items():
+            center = cell.center - pd_size
+            if center[0] < 0 or center[1] < 0:
+                continue
+            # Use propagated_value as the score (final value after diffusion)
+            score = cell.propagated_value
+            if score > 0:  # Only show non-zero scores
+                ax.text(center[1], center[0], f'{score:.2f}',
+                       fontsize=6, ha='center', va='center',
+                       bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7))
     
     ax.legend(loc='upper right', fontsize=8)
     ax.set_title(f'Cell Graph (Real: {len(real_nodes)}, Ghost: {len(ghost_nodes)})')
