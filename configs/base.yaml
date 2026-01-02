@@ -44,6 +44,10 @@ nbh:
   graph_diffuse_gamma: 0.95
   graph_diffuse_iterations: 50
   graph_diffuse_on_update: false
+  graph_debug_edges: false
+  graph_debug_targets: false
+  graph_debug_belief: false
+  graph_debug_propagation_stats: false
 
 flow_logging:
   enabled: true

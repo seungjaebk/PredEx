@@ -317,18 +317,26 @@ class CellManager:
                     if not neighbor.is_blocked:
                         involves_ghost = node.is_ghost or neighbor.is_ghost
                         if not involves_ghost:
+                            edge_type = "RR"
                             ok, _info = self._check_rr_edge(
                                 idx, (nr, nc), obs_map, pred_mean_map, self.free_mask
                             )
-                            if ok:
-                                node.neighbors.append(neighbor)
                         else:
                             edge_type = "RG" if (node.is_ghost != neighbor.is_ghost) else "GG"
                             ok, _info = self._check_ghost_edge(
                                 idx, (nr, nc), obs_map, pred_mean_map, edge_type
                             )
-                            if ok:
-                                node.neighbors.append(neighbor)
+
+                        self._log_edge_debug(
+                            edge_type,
+                            _info["portal"],
+                            _info["los"],
+                            _info["mini"],
+                            _info["cache"],
+                            _info["ttl_left"],
+                        )
+                        if ok:
+                            node.neighbors.append(neighbor)
     
     def _build_cost_grid(self, obs_map, pred_mean_map=None, edge_type="RR"):
         unknown_as_occ = self.connectivity_cfg.get("graph_unknown_as_occ", True)
@@ -353,7 +361,7 @@ class CellManager:
             ok, path_len, reason, last_step = entry
             ttl_left = cache_ttl - (self._mini_astar_step - last_step)
             if ttl_left > 0:
-                return ok, path_len, reason
+                return ok, path_len, reason, "hit", ttl_left
 
         start = tuple(self.get_cell_center(node_idx).astype(int))
         goal = tuple(self.get_cell_center(neighbor_idx).astype(int))
@@ -364,7 +372,7 @@ class CellManager:
             result = (True, int(path.shape[0]), "ok")
 
         self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
-        return result
+        return result[0], result[1], result[2], "miss", cache_ttl
 
     def _boundary_wall_ratio(self, obs_map, node_idx, neighbor_idx):
         centroid1 = self.get_cell_center(node_idx)
@@ -398,24 +406,73 @@ class CellManager:
 
         los_ok = self._check_path_clear(node_idx, neighbor_idx, obs_map)
         if portal_ok and los_ok:
-            return True, {"portal": True, "los": True, "mini": None}
+            return True, {
+                "portal": True,
+                "los": True,
+                "mini": None,
+                "cache": "skip",
+                "ttl_left": None,
+            }
 
         if portal_ok and not los_ok:
             cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type="RR")
-            ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost, "RR")
-            return ok, {"portal": True, "los": False, "mini": (ok, path_len, reason)}
+            ok, path_len, reason, cache_status, ttl_left = self._run_mini_astar(
+                node_idx, neighbor_idx, cost, "RR"
+            )
+            return ok, {
+                "portal": True,
+                "los": False,
+                "mini": (ok, path_len, reason),
+                "cache": cache_status,
+                "ttl_left": ttl_left,
+            }
 
         if not portal_ok and self._should_fallback_when_portal_false(obs_map, node_idx, neighbor_idx):
             cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type="RR")
-            ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost, "RR")
-            return ok, {"portal": False, "los": False, "mini": (ok, path_len, reason)}
+            ok, path_len, reason, cache_status, ttl_left = self._run_mini_astar(
+                node_idx, neighbor_idx, cost, "RR"
+            )
+            return ok, {
+                "portal": False,
+                "los": False,
+                "mini": (ok, path_len, reason),
+                "cache": cache_status,
+                "ttl_left": ttl_left,
+            }
 
-        return False, {"portal": False, "los": False, "mini": None}
+        return False, {
+            "portal": False,
+            "los": False,
+            "mini": None,
+            "cache": "skip",
+            "ttl_left": None,
+        }
 
     def _check_ghost_edge(self, node_idx, neighbor_idx, obs_map, pred_mean_map, edge_type):
         cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type=edge_type)
-        ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost, edge_type)
-        return ok, {"portal": None, "los": None, "mini": (ok, path_len, reason)}
+        ok, path_len, reason, cache_status, ttl_left = self._run_mini_astar(
+            node_idx, neighbor_idx, cost, edge_type
+        )
+        return ok, {
+            "portal": None,
+            "los": None,
+            "mini": (ok, path_len, reason),
+            "cache": cache_status,
+            "ttl_left": ttl_left,
+        }
+
+    def _log_edge_debug(self, edge_type, portal, los, mini, cache_status, ttl_left):
+        if not self.debug_cfg.get("graph_debug_edges", False):
+            return
+        mini_str = "none"
+        if mini is not None:
+            ok, path_len, reason = mini
+            mini_str = f"hit={ok} path_len={path_len} fail_reason={reason}"
+        ttl_str = "NA" if ttl_left is None else ttl_left
+        print(
+            f"edge_type={edge_type} portal={portal} los={los} "
+            f"miniA*({mini_str}) cache={cache_status} ttl_left={ttl_str}"
+        )
 
     def _check_path_clear(self, node_idx, neighbor_idx, obs_map, pred_mean_map=None, involves_ghost=False):
         """

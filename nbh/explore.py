@@ -229,7 +229,12 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         }
 
         connectivity_cfg = {}
-        debug_cfg = {}
+        debug_cfg = {
+            "graph_debug_edges": nbh_cfg.get("graph_debug_edges", False),
+            "graph_debug_targets": nbh_cfg.get("graph_debug_targets", False),
+            "graph_debug_belief": nbh_cfg.get("graph_debug_belief", False),
+            "graph_debug_propagation_stats": nbh_cfg.get("graph_debug_propagation_stats", False),
+        }
         
         if USE_ASTAR_FOR_LOCAL:
             print("=" * 60)
@@ -567,7 +572,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         inflated_occ_grid=occ_grid_pyastar
                     )
 
-                    if DEBUG_PROPAGATION_STATS and cell_manager.cells:
+                    if debug_cfg.get("graph_debug_propagation_stats") and cell_manager.cells:
                         values = np.array(
                             [node.propagated_value for node in cell_manager.cells.values()],
                             dtype=np.float32,
@@ -657,11 +662,22 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         # --- STEP 1: Find/update high-level exploration target ---
                         # Check if target is still reachable
                         target_unreachable = False
+                        target_unreachable_reason = None
                         if target_cell is not None and cell_manager.current_cell is not None:
                             path_to_target = cell_manager.find_path_to_target(cell_manager.current_cell, target_cell)
                             if path_to_target is None:
                                 target_unreachable = True
-                                print(f"[HIGH-LEVEL] Target {target_cell.index} is now UNREACHABLE, selecting new target")
+                                if target_cell.is_blocked:
+                                    target_unreachable_reason = "blocked"
+                                elif target_cell.index not in cell_manager.cells:
+                                    target_unreachable_reason = "node_missing"
+                                else:
+                                    target_unreachable_reason = "edge_removed_or_cache_invalidated"
+                                if debug_cfg.get("graph_debug_targets"):
+                                    print(
+                                        f"[HIGH-LEVEL] Target {target_cell.index} unreachable "
+                                        f"(reason={target_unreachable_reason})"
+                                    )
                         
                         target_change_reasons = []
                         if target_cell is None:
@@ -678,7 +694,8 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         
                         if need_new_high_level_target:
                             reasons_str = ", ".join(target_change_reasons)
-                            print(f"[HIGH-LEVEL] Reselecting target (reason: {reasons_str})")
+                            if debug_cfg.get("graph_debug_targets"):
+                                print(f"[HIGH-LEVEL] Reselecting target (reason: {reasons_str})")
                             # Find best ghost cell (highest uncertainty) that is REACHABLE from current cell
                             exploration_target = cell_manager.find_exploration_target(
                                 latest_pred_var_map if latest_pred_var_map is not None else np.zeros_like(mapper.obs_map),
@@ -687,7 +704,8 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             
                             if exploration_target is not None:
                                 target_cell = exploration_target
-                                print(f"[HIGH-LEVEL] New exploration target: {target_cell.index}")
+                                if debug_cfg.get("graph_debug_targets"):
+                                    print(f"[HIGH-LEVEL] New exploration target: {target_cell.index}")
                                 
                                 # --- STEP 2: Propagate goal scent from target (O(cells), once) ---
                                 cell_manager.propagate_goal_scent(target_cell, decay=0.9, iterations=30)
@@ -701,7 +719,8 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                 else:
                                     print(f"[PATH] No path found to target!")
                             else:
-                                print("[HIGH-LEVEL] No exploration target found!")
+                                if debug_cfg.get("graph_debug_targets"):
+                                    print("[HIGH-LEVEL] No exploration target found!")
                                 path_to_target = None
                         
                         # --- STEP 3: Get next cell from BFS path (primary) or greedy fallback ---
