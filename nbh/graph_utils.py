@@ -1,5 +1,6 @@
 import numpy as np
 import cv2
+import pyastar2d
 from collections import deque
 
 DEBUG_GRAPH = False
@@ -283,15 +284,92 @@ class CellManager:
                     neighbor = self.cells[(nr, nc)]
                     if not neighbor.is_blocked:
                         involves_ghost = node.is_ghost or neighbor.is_ghost
-                        if not involves_ghost and self.free_mask is not None:
-                            # Real-real edges: use portal check on inflated free space
-                            if self._check_portal_clear(idx, (nr, nc), self.free_mask) and self._check_path_clear(idx, (nr, nc), obs_map, pred_mean_map, involves_ghost=False):
+                        if not involves_ghost:
+                            ok, _info = self._check_rr_edge(
+                                idx, (nr, nc), obs_map, pred_mean_map, self.free_mask
+                            )
+                            if ok:
                                 node.neighbors.append(neighbor)
                         else:
-                            # Ghost-involved edges: keep strict line-of-sight check
-                            if self._check_path_clear(idx, (nr, nc), obs_map, pred_mean_map, involves_ghost):
+                            edge_type = "RG" if (node.is_ghost != neighbor.is_ghost) else "GG"
+                            ok, _info = self._check_ghost_edge(
+                                idx, (nr, nc), obs_map, pred_mean_map, edge_type
+                            )
+                            if ok:
                                 node.neighbors.append(neighbor)
     
+    def _build_cost_grid(self, obs_map, pred_mean_map=None, edge_type="RR"):
+        unknown_as_occ = self.connectivity_cfg.get("graph_unknown_as_occ", True)
+        pred_wall_threshold = self.connectivity_cfg.get("graph_pred_wall_threshold", 0.7)
+
+        cost = np.ones_like(obs_map, dtype=np.float32)
+        cost[obs_map >= 0.8] = np.inf
+        if unknown_as_occ:
+            cost[obs_map == 0.5] = np.inf
+
+        if edge_type in ("RG", "GG") and pred_mean_map is not None:
+            cost[pred_mean_map > pred_wall_threshold] = np.inf
+        return cost
+
+    def _run_mini_astar(self, node_idx, neighbor_idx, cost_grid):
+        start = tuple(self.get_cell_center(node_idx).astype(int))
+        goal = tuple(self.get_cell_center(neighbor_idx).astype(int))
+        path = pyastar2d.astar_path(cost_grid, start, goal, allow_diagonal=False)
+        if path is None:
+            return False, 0, "no_path"
+        return True, int(path.shape[0]), "ok"
+
+    def _boundary_wall_ratio(self, obs_map, node_idx, neighbor_idx):
+        centroid1 = self.get_cell_center(node_idx)
+        centroid2 = self.get_cell_center(neighbor_idx)
+        num_samples = self.cell_size
+        wall_hits = 0
+        valid_samples = 0
+
+        for i in range(num_samples + 1):
+            t = i / num_samples
+            r = int(centroid1[0] * (1 - t) + centroid2[0] * t)
+            c = int(centroid1[1] * (1 - t) + centroid2[1] * t)
+            if 0 <= r < obs_map.shape[0] and 0 <= c < obs_map.shape[1]:
+                valid_samples += 1
+                if obs_map[r, c] >= 0.8:
+                    wall_hits += 1
+
+        if valid_samples == 0:
+            return 1.0
+        return float(wall_hits) / float(valid_samples)
+
+    def _should_fallback_when_portal_false(self, obs_map, node_idx, neighbor_idx):
+        max_ratio = self.connectivity_cfg.get("graph_portal_fallback_max_obs_ratio", 0.2)
+        return self._boundary_wall_ratio(obs_map, node_idx, neighbor_idx) <= max_ratio
+
+    def _check_rr_edge(self, node_idx, neighbor_idx, obs_map, pred_mean_map, free_mask):
+        portal_ok = False
+        if free_mask is not None:
+            thickness = self.connectivity_cfg.get("graph_portal_thickness", 2)
+            portal_ok = self._check_portal_clear(node_idx, neighbor_idx, free_mask, thickness=thickness)
+
+        los_ok = self._check_path_clear(node_idx, neighbor_idx, obs_map)
+        if portal_ok and los_ok:
+            return True, {"portal": True, "los": True, "mini": None}
+
+        if portal_ok and not los_ok:
+            cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type="RR")
+            ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost)
+            return ok, {"portal": True, "los": False, "mini": (ok, path_len, reason)}
+
+        if not portal_ok and self._should_fallback_when_portal_false(obs_map, node_idx, neighbor_idx):
+            cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type="RR")
+            ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost)
+            return ok, {"portal": False, "los": False, "mini": (ok, path_len, reason)}
+
+        return False, {"portal": False, "los": False, "mini": None}
+
+    def _check_ghost_edge(self, node_idx, neighbor_idx, obs_map, pred_mean_map, edge_type):
+        cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type=edge_type)
+        ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost)
+        return ok, {"portal": None, "los": None, "mini": (ok, path_len, reason)}
+
     def _check_path_clear(self, node_idx, neighbor_idx, obs_map, pred_mean_map=None, involves_ghost=False):
         """
         Check if robot can pass between two adjacent cells.
@@ -320,13 +398,6 @@ class CellManager:
                 if obs_val >= 0.8:
                     return False
                 
-                # For ghost cells, also check prediction
-                if involves_ghost and pred_mean_map is not None:
-                    if 0 <= r < pred_mean_map.shape[0] and 0 <= c < pred_mean_map.shape[1]:
-                        pred_val = pred_mean_map[r, c]
-                        if pred_val > 0.5:
-                            return False
-        
         # Centroid line is clear
         return True
 
