@@ -34,6 +34,17 @@ local_planner: 'astar'  # Options: 'astar', 'flow'
 # 25px = 2.5m, 20px = 2.0m, 30px = 3.0m
 cell_size: 25
 
+nbh:
+  graph_max_ghost_distance: 2
+  graph_obs_blocked_ratio: 0.3
+  graph_unknown_ratio_threshold: 0.5
+  graph_centroid_blocked_threshold: 0.8
+  graph_ghost_pred_mean_free_threshold: 0.4
+  graph_ghost_pred_var_max_threshold: 0.3
+  graph_diffuse_gamma: 0.95
+  graph_diffuse_iterations: 50
+  graph_diffuse_on_update: false
+
 flow_logging:
   enabled: true
   save_every: 1          # log every N planner steps

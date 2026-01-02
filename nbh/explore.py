@@ -214,6 +214,22 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         # 'flow': Use Flow model for local planning (what we're developing)
         USE_ASTAR_FOR_LOCAL = (collect_opts.local_planner == 'astar')
         CELL_SIZE_CONFIG = collect_opts.cell_size  # From yaml/CLI
+        nbh_cfg = getattr(collect_opts, "nbh", {})
+
+        promotion_cfg = {
+            "graph_max_ghost_distance": nbh_cfg.get("graph_max_ghost_distance", 2),
+            "graph_obs_blocked_ratio": nbh_cfg.get("graph_obs_blocked_ratio", 0.3),
+            "graph_unknown_ratio_threshold": nbh_cfg.get("graph_unknown_ratio_threshold", 0.5),
+            "graph_centroid_blocked_threshold": nbh_cfg.get("graph_centroid_blocked_threshold", 0.8),
+            "graph_ghost_pred_mean_free_threshold": nbh_cfg.get("graph_ghost_pred_mean_free_threshold", 0.4),
+            "graph_ghost_pred_var_max_threshold": nbh_cfg.get("graph_ghost_pred_var_max_threshold", 0.3),
+            "graph_diffuse_gamma": nbh_cfg.get("graph_diffuse_gamma", 0.95),
+            "graph_diffuse_iterations": nbh_cfg.get("graph_diffuse_iterations", 50),
+            "graph_diffuse_on_update": nbh_cfg.get("graph_diffuse_on_update", False),
+        }
+
+        connectivity_cfg = {}
+        debug_cfg = {}
         
         if USE_ASTAR_FOR_LOCAL:
             print("=" * 60)
@@ -235,7 +251,14 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         if mode == 'nbh':
             # Robot-centric cell manager: start_pose becomes centroid of cell (0, 0)
             # Cell indices can be negative (robot can move "backwards" from start)
-            cell_manager = CellManager(cell_size=CELL_SIZE_CONFIG, start_pose=start_pose, valid_space_map=validspace_map)
+            cell_manager = CellManager(
+                cell_size=CELL_SIZE_CONFIG,
+                start_pose=start_pose,
+                valid_space_map=validspace_map,
+                promotion_cfg=promotion_cfg,
+                connectivity_cfg=connectivity_cfg,
+                debug_cfg=debug_cfg,
+            )
             print(f"Initialized NBH Cell Manager (Cell Size: {CELL_SIZE_CONFIG}px = {CELL_SIZE_CONFIG/10}m, Origin: {start_pose})")
             
         if mode != 'upen':

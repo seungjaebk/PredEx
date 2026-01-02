@@ -26,7 +26,15 @@ class CellNode:
         return f"[{type_str}]Cell{self.index}(Val:{self.propagated_value:.2f})"
 
 class CellManager:
-    def __init__(self, cell_size=50, start_pose=None, valid_space_map=None):
+    def __init__(
+        self,
+        cell_size=50,
+        start_pose=None,
+        valid_space_map=None,
+        promotion_cfg=None,
+        connectivity_cfg=None,
+        debug_cfg=None,
+    ):
         """
         Robot-centric cell manager for unknown map exploration.
         
@@ -38,6 +46,9 @@ class CellManager:
         self.cell_size = cell_size
         self.free_mask = None
         self.last_obs_shape = None
+        self.promotion_cfg = promotion_cfg or {}
+        self.connectivity_cfg = connectivity_cfg or {}
+        self.debug_cfg = debug_cfg or {}
         
         # Robot's start position is the centroid of cell (0, 0)
         # This will be set on first update_graph call if not provided
@@ -51,6 +62,14 @@ class CellManager:
 
         # Visualization (dynamic, updated as needed)
         self.scent_map_vis = None  # Will be created dynamically
+
+    def _get_cfg(self, key, default):
+        return self.promotion_cfg.get(key, default)
+
+    def _patch_mean(self, patch, default=0.0):
+        if patch is None or patch.size == 0:
+            return default
+        return float(np.mean(patch))
 
     def get_cell_index(self, pixel_pose):
         """
@@ -109,6 +128,12 @@ class CellManager:
         """
         map_h, map_w = obs_map.shape
         self.free_mask = free_mask
+        max_ghost_distance = self._get_cfg("graph_max_ghost_distance", max_ghost_distance)
+        obs_blocked_ratio = self._get_cfg("graph_obs_blocked_ratio", 0.3)
+        unknown_ratio_threshold = self._get_cfg("graph_unknown_ratio_threshold", 0.5)
+        centroid_blocked_threshold = self._get_cfg("graph_centroid_blocked_threshold", 0.8)
+        pred_mean_free_threshold = self._get_cfg("graph_ghost_pred_mean_free_threshold", 0.4)
+        pred_var_max_threshold = self._get_cfg("graph_ghost_pred_var_max_threshold", 0.3)
         
         # --- 1. UPDATE REAL NODES (Observed) ---
         # Expand from existing cells + their neighbors
@@ -180,26 +205,18 @@ class CellManager:
             centroid_obs_val = obs_map[centroid_r, centroid_c]
 
             # Check Obstacle status
-            is_obs_blocked = np.mean(patch_obs == 1) > 0.3 # If >30% occupied
-            if centroid_obs_val >= 0.8:
+            is_obs_blocked = np.mean(patch_obs == 1) > obs_blocked_ratio  # If >30% occupied
+            if centroid_obs_val >= centroid_blocked_threshold:
                 is_obs_blocked = True
             
-            # Check Unknown status
+            # Check Unknown status (patch-based)
             unknown_ratio = float(np.mean(patch_obs == 0.5))
-            centroid_unknown = (centroid_obs_val == 0.5)
-            is_unknown = (unknown_ratio > 0.5) and centroid_unknown
+            is_unknown = (unknown_ratio > unknown_ratio_threshold)
             
             # Check Prediction status (Ghost)
-            # If unknown but Predicted Free (< 0.3 prob of wall), it's a Ghost Candidate
-            is_pred_free = False
-            pred_center = None
-            if pred_mean_map is not None:
-                pred_h, pred_w = pred_mean_map.shape
-                if 0 <= centroid_r < pred_h and 0 <= centroid_c < pred_w:
-                    # pred_mean is probability of occupancy? usually 0=Free, 1=Occ
-                    # Let's assume [0,1] range.
-                    pred_center = float(pred_mean_map[centroid_r, centroid_c])
-                    is_pred_free = pred_center < 0.3
+            # If unknown but Predicted Free, it's a Ghost Candidate
+            pred_mean_patch = self._patch_mean(patch_pred, default=1.0)
+            is_pred_free = pred_mean_patch < pred_mean_free_threshold
 
             # Prediction variance at centroid (for debug and gating)
             pred_var_center = None
@@ -211,7 +228,7 @@ class CellManager:
             # Debug: inspect specific cells near start
             debug_indices = {(0, -1), (1, 0)}
             if idx in debug_indices:
-                pred_mean_str = f"{pred_center:.3f}" if pred_center is not None else "NA"
+                pred_mean_str = f"{pred_mean_patch:.3f}" if pred_mean_map is not None else "NA"
                 pred_var_str = f"{pred_var_center:.3f}" if pred_var_center is not None else "NA"
                 ghost_distance = distances.get(idx, float('inf'))
             if DEBUG_GRAPH:
@@ -238,19 +255,16 @@ class CellManager:
                 # GHOST NODE - but only if uncertainty is LOW enough
                 # High variance = uncertain = don't trust the prediction
                 cell_variance = 1.0  # Default high (don't expand)
-                
+                var_patch = None
                 if pred_var_map is not None:
-                    var_h, var_w = pred_var_map.shape
-                    if 0 <= centroid_r < var_h and 0 <= centroid_c < var_w:
-                        cell_variance = float(pred_var_map[centroid_r, centroid_c])
+                    var_patch = pred_var_map[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
+                cell_variance = self._patch_mean(var_patch, default=1.0)
                 
                 # Only create ghost if:
                 # 1. Variance is below threshold (model is confident it's free)
                 # 2. Distance from real cell is reasonable (still need some limit)
                 ghost_distance = distances.get(idx, float('inf'))
-                max_var_threshold = 0.3  # Only expand if variance < 0.3 (high confidence)
-                
-                if cell_variance < max_var_threshold and ghost_distance <= max_ghost_distance:
+                if cell_variance < pred_var_max_threshold and ghost_distance <= max_ghost_distance:
                     node = self.get_cell(idx, is_ghost=True)
                     node.is_blocked = False
                     node.base_value = cell_variance  # Store actual variance
@@ -442,13 +456,13 @@ class CellManager:
                 continue
                 
             if node.is_ghost:
-                # Use centroid variance for consistent scoring
-                centroid_r = int(node.center[0])
-                centroid_c = int(node.center[1])
-                if 0 <= centroid_r < map_h and 0 <= centroid_c < map_w:
-                    node.base_value = float(pred_var_map[centroid_r, centroid_c])
-                else:
-                    node.base_value = 0.0
+                half = self.cell_size // 2
+                r0 = max(0, int(node.center[0] - half))
+                r1 = min(map_h, int(node.center[0] + half))
+                c0 = max(0, int(node.center[1] - half))
+                c1 = min(map_w, int(node.center[1] + half))
+                patch = pred_var_map[r0:r1, c0:c1]
+                node.base_value = self._patch_mean(patch, default=0.0)
             
             # Reset propagation to base
             node.propagated_value = node.base_value
@@ -456,8 +470,8 @@ class CellManager:
         # 2. Iterative Diffusion (Bellman Update)
         # V_new = V_base + gamma * max(Neighbors)
         # Using 'max' (Gradient) instead of 'mean' (Diffusion) creates a stronger path.
-        gamma = 0.95  # Decay factor
-        iterations = 50  # Enough to cover the map
+        gamma = self._get_cfg("graph_diffuse_gamma", 0.95)  # Decay factor
+        iterations = int(self._get_cfg("graph_diffuse_iterations", 50))  # Enough to cover the map
         
         for _ in range(iterations):
             # Create copy of values to update synchronously (or async is fine too)
@@ -513,7 +527,7 @@ class CellManager:
         else:
             curr_node.visit_count += 1
 
-        if pred_var_map is not None:
+        if pred_var_map is not None and self._get_cfg("graph_diffuse_on_update", True):
             self.diffuse_scent(pred_var_map)
         
         # DEBUG: Print current cell info
