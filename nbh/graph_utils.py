@@ -35,6 +35,7 @@ class CellManager:
         """
         self.cell_size = cell_size
         self.free_mask = None
+        self.last_obs_shape = None
         
         # Robot's start position is the centroid of cell (0, 0)
         # This will be set on first update_graph call if not provided
@@ -385,6 +386,40 @@ class CellManager:
             return np.any(np.any(a_strip, axis=0) & np.any(b_strip, axis=0))
 
         return False
+
+    def _align_pred_map(self, pred_map, obs_shape, fill_value=1.0):
+        if pred_map is None or obs_shape is None:
+            return pred_map
+
+        pred_h, pred_w = pred_map.shape
+        obs_h, obs_w = obs_shape
+        if pred_h == obs_h and pred_w == obs_w:
+            return pred_map
+
+        aligned = np.full((obs_h, obs_w), fill_value, dtype=pred_map.dtype)
+
+        if pred_h >= obs_h:
+            src_top = (pred_h - obs_h) // 2
+            dst_top = 0
+            copy_h = obs_h
+        else:
+            src_top = 0
+            dst_top = (obs_h - pred_h) // 2
+            copy_h = pred_h
+
+        if pred_w >= obs_w:
+            src_left = (pred_w - obs_w) // 2
+            dst_left = 0
+            copy_w = obs_w
+        else:
+            src_left = 0
+            dst_left = (obs_w - pred_w) // 2
+            copy_w = pred_w
+
+        aligned[dst_top:dst_top + copy_h, dst_left:dst_left + copy_w] = pred_map[
+            src_top:src_top + copy_h, src_left:src_left + copy_w
+        ]
+        return aligned
     
     def diffuse_scent(self, pred_var_map):
         """
@@ -448,6 +483,7 @@ class CellManager:
         if self.origin is None:
             self.origin = np.array(robot_pose, dtype=float)
             print(f"[GRAPH] Origin set to robot start: {self.origin}")
+        self.last_obs_shape = obs_map.shape
         
         # 1. Update structure (Real + Ghost nodes)
         free_mask = None
@@ -715,6 +751,7 @@ class CellManager:
         best_value = -1e9
         
         # Run diffusion first to get propagated values
+        pred_var_map = self._align_pred_map(pred_var_map, self.last_obs_shape)
         self.diffuse_scent(pred_var_map)
         
         # Find all cells reachable from current_cell using BFS
