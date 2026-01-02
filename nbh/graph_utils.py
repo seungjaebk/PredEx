@@ -64,6 +64,15 @@ class CellManager:
         # Visualization (dynamic, updated as needed)
         self.scent_map_vis = None  # Will be created dynamically
 
+        self._mini_astar_cache = {}
+        self._mini_astar_step = 0
+        self._obs_update_id = 0
+        self._pred_update_id = 0
+        self._grid_update_id = 0
+        self._last_obs_map = None
+        self._last_pred_map = None
+        self._last_inflated_sig = None
+
     def _get_cfg(self, key, default):
         return self.promotion_cfg.get(key, default)
 
@@ -71,6 +80,29 @@ class CellManager:
         if patch is None or patch.size == 0:
             return default
         return float(np.mean(patch))
+
+    def _map_change_ratio(self, prev, curr):
+        if prev is None:
+            return 1.0
+        if prev.shape != curr.shape:
+            return 1.0
+        return float(np.mean(prev != curr))
+
+    def _inflated_signature(self, grid):
+        if grid is None:
+            return None
+        finite = np.isfinite(grid)
+        return (grid.shape, int(np.count_nonzero(finite)))
+
+    def _grid_policy_hash(self):
+        return hash((
+            self.connectivity_cfg.get("graph_unknown_as_occ", True),
+            self.connectivity_cfg.get("graph_pred_wall_threshold", 0.7),
+            self.connectivity_cfg.get("graph_dilate_diam", 3),
+            self._obs_update_id,
+            self._pred_update_id,
+            self._grid_update_id,
+        ))
 
     def get_cell_index(self, pixel_pose):
         """
@@ -311,13 +343,28 @@ class CellManager:
             cost[pred_mean_map > pred_wall_threshold] = np.inf
         return cost
 
-    def _run_mini_astar(self, node_idx, neighbor_idx, cost_grid):
+    def _run_mini_astar(self, node_idx, neighbor_idx, cost_grid, edge_type):
+        cache_ttl = self.connectivity_cfg.get("graph_mini_astar_ttl_steps", 10)
+        policy_hash = self._grid_policy_hash()
+        cache_key = (node_idx, neighbor_idx, edge_type, policy_hash)
+
+        entry = self._mini_astar_cache.get(cache_key)
+        if entry is not None:
+            ok, path_len, reason, last_step = entry
+            ttl_left = cache_ttl - (self._mini_astar_step - last_step)
+            if ttl_left > 0:
+                return ok, path_len, reason
+
         start = tuple(self.get_cell_center(node_idx).astype(int))
         goal = tuple(self.get_cell_center(neighbor_idx).astype(int))
         path = pyastar2d.astar_path(cost_grid, start, goal, allow_diagonal=False)
         if path is None:
-            return False, 0, "no_path"
-        return True, int(path.shape[0]), "ok"
+            result = (False, 0, "no_path")
+        else:
+            result = (True, int(path.shape[0]), "ok")
+
+        self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
+        return result
 
     def _boundary_wall_ratio(self, obs_map, node_idx, neighbor_idx):
         centroid1 = self.get_cell_center(node_idx)
@@ -355,19 +402,19 @@ class CellManager:
 
         if portal_ok and not los_ok:
             cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type="RR")
-            ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost)
+            ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost, "RR")
             return ok, {"portal": True, "los": False, "mini": (ok, path_len, reason)}
 
         if not portal_ok and self._should_fallback_when_portal_false(obs_map, node_idx, neighbor_idx):
             cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type="RR")
-            ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost)
+            ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost, "RR")
             return ok, {"portal": False, "los": False, "mini": (ok, path_len, reason)}
 
         return False, {"portal": False, "los": False, "mini": None}
 
     def _check_ghost_edge(self, node_idx, neighbor_idx, obs_map, pred_mean_map, edge_type):
         cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type=edge_type)
-        ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost)
+        ok, path_len, reason = self._run_mini_astar(node_idx, neighbor_idx, cost, edge_type)
         return ok, {"portal": None, "los": None, "mini": (ok, path_len, reason)}
 
     def _check_path_clear(self, node_idx, neighbor_idx, obs_map, pred_mean_map=None, involves_ghost=False):
@@ -572,6 +619,29 @@ class CellManager:
             self.origin = np.array(robot_pose, dtype=float)
             print(f"[GRAPH] Origin set to robot start: {self.origin}")
         self.last_obs_shape = obs_map.shape
+        self._mini_astar_step += 1
+
+        change_threshold = self.connectivity_cfg.get("graph_cache_change_ratio_threshold", 0.01)
+        obs_change = self._map_change_ratio(self._last_obs_map, obs_map)
+        if obs_change > change_threshold:
+            self._obs_update_id += 1
+            self._mini_astar_cache.clear()
+        self._last_obs_map = obs_map.copy()
+
+        if pred_mean_map is not None:
+            pred_change = self._map_change_ratio(self._last_pred_map, pred_mean_map)
+            if pred_change > change_threshold:
+                self._pred_update_id += 1
+                self._mini_astar_cache.clear()
+            self._last_pred_map = pred_mean_map.copy()
+        else:
+            self._last_pred_map = None
+
+        inflated_sig = self._inflated_signature(inflated_occ_grid)
+        if inflated_sig != self._last_inflated_sig:
+            self._grid_update_id += 1
+            self._mini_astar_cache.clear()
+        self._last_inflated_sig = inflated_sig
         
         # 1. Update structure (Real + Ghost nodes)
         free_mask = None
