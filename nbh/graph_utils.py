@@ -2,6 +2,8 @@ import numpy as np
 import cv2
 from collections import deque
 
+DEBUG_GRAPH = False
+
 class CellNode:
     def __init__(self, index, center_pixel, is_ghost=False):
         self.index = index # (row, col) tuple
@@ -212,6 +214,7 @@ class CellManager:
                 pred_mean_str = f"{pred_center:.3f}" if pred_center is not None else "NA"
                 pred_var_str = f"{pred_var_center:.3f}" if pred_var_center is not None else "NA"
                 ghost_distance = distances.get(idx, float('inf'))
+            if DEBUG_GRAPH:
                 print(
                     f"[DEBUG][GHOST_CAND] idx={idx} "
                     f"unknown_ratio={unknown_ratio:.3f} centroid_obs={centroid_obs_val:.2f} "
@@ -514,8 +517,9 @@ class CellManager:
             self.diffuse_scent(pred_var_map)
         
         # DEBUG: Print current cell info
-        print(f"[DEBUG] Current cell: idx={curr_node.index}, centroid={curr_node.center}, "
-              f"obs_map.shape={obs_map.shape}, robot_pose={robot_pose}")
+        if DEBUG_GRAPH:
+            print(f"[DEBUG] Current cell: idx={curr_node.index}, centroid={curr_node.center}, "
+                  f"obs_map.shape={obs_map.shape}, robot_pose={robot_pose}")
 
     def get_best_target_cell(self, pred_var_map, obs_map):
         """Select next cell based on Diffused Scent."""

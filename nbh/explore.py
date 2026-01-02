@@ -85,6 +85,9 @@ def dummy_context_manager():
     yield None
 
 
+DEBUG_PROPAGATION_STATS = True
+
+
 def align_pred_map(pred_map, obs_shape, fill_value):
     if pred_map is None:
         return None
@@ -540,6 +543,18 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         pred_var_map=unpadded_pred_var,  # Cropped to match obs_map coordinates
                         inflated_occ_grid=occ_grid_pyastar
                     )
+
+                    if DEBUG_PROPAGATION_STATS and cell_manager.cells:
+                        values = np.array(
+                            [node.propagated_value for node in cell_manager.cells.values()],
+                            dtype=np.float32,
+                        )
+                        nonzero = int(np.count_nonzero(values > 0))
+                        print(
+                            f"[PROP] t={t} min={float(values.min()):.6f} "
+                            f"max={float(values.max()):.6f} mean={float(values.mean()):.6f} "
+                            f"nonzero={nonzero}/{len(values)}"
+                        )
                     
                     # Ensure we have latest prediction (updated in need_new_locked_frontier block)
                     # If flow mode didn't trigger update, we must check.
