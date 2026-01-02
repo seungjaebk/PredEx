@@ -43,3 +43,18 @@ def pick_farthest_los_cell(cur_pose: np.ndarray, path_cells, obs_map: np.ndarray
         else:
             break
     return last_visible
+
+
+def select_waypoint_cell(cur_pose: np.ndarray, path_cells, obs_map: np.ndarray):
+    """Choose the farthest LOS cell, falling back to the next path cell."""
+    if not path_cells:
+        return None
+
+    los_cell = pick_farthest_los_cell(cur_pose, path_cells, obs_map)
+    if los_cell is not None and los_cell is not path_cells[0]:
+        return los_cell
+
+    if len(path_cells) > 1:
+        return path_cells[1]
+
+    return None

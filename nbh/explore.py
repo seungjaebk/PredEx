@@ -49,6 +49,7 @@ from nbh.exploration_config import (
 from nbh.graph_utils import CellManager
 from nbh.flow_planner import load_flow_model
 from nbh.high_level_planner import WaypointState
+from nbh.waypoint_utils import select_waypoint_cell
 from nbh.flow_viz_utils import (
     sample_multiple_trajectories, visualize_trajectory_distribution,
     visualize_cell_graph, select_best_trajectory
@@ -609,41 +610,6 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     
                     # Only get new target if waypoint is cleared
                     if current_waypoint is None:
-                        # --- Helper: Line of Sight Check ---
-                        def check_line_of_sight(start, end, obs_map):
-                            """Check if there's a clear path from start to end (no walls)."""
-                            r0, c0 = int(start[0]), int(start[1])
-                            r1, c1 = int(end[0]), int(end[1])
-                            
-                            # Bresenham's line algorithm
-                            dr = abs(r1 - r0)
-                            dc = abs(c1 - c0)
-                            sr = 1 if r0 < r1 else -1
-                            sc = 1 if c0 < c1 else -1
-                            err = dr - dc
-                            
-                            r, c = r0, c0
-                            while True:
-                                # Check bounds
-                                if 0 <= r < obs_map.shape[0] and 0 <= c < obs_map.shape[1]:
-                                    if obs_map[r, c] == 1.0:  # Hit a wall
-                                        return False
-                                else:
-                                    return False  # Out of bounds
-                                
-                                if r == r1 and c == c1:
-                                        break
-                                    
-                                e2 = 2 * err
-                                if e2 > -dc:
-                                    err -= dc
-                                    r += sr
-                                if e2 < dr:
-                                    err += dr
-                                    c += sc
-                            
-                            return True  # Clear path
-                        
                         # Decision Making: Where to flow next?
                         # HYBRID NAVIGATION:
                         # 1. Find high-level target (highest uncertainty ghost cell) - when target changes
@@ -701,13 +667,22 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                 path_to_target = None
                         
                         # --- STEP 3: Get next cell from BFS path (primary) or greedy fallback ---
-                        # First try to follow the computed BFS path
-                        next_cell, decision_type = cell_manager.get_next_path_cell(path_to_target)
-                        
+                        next_cell = None
+                        decision_type = "NO_PATH"
+                        if path_to_target is not None and cell_manager.current_cell is not None:
+                            on_path = any(
+                                cell.index == cell_manager.current_cell.index
+                                for cell in path_to_target
+                            )
+                            if on_path and len(path_to_target) > 1:
+                                next_cell = select_waypoint_cell(cur_pose, path_to_target, mapper.obs_map)
+                                if next_cell is not None:
+                                    decision_type = "PATH_LOS"
+
                         # If path following fails, use greedy neighbor selection
                         if next_cell is None:
                             next_cell, decision_type = cell_manager.pick_best_neighbor(
-                                target_cell, 
+                                target_cell,
                                 mapper.obs_map
                             )
                         
