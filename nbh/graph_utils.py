@@ -473,6 +473,9 @@ class CellManager:
             curr_node.visit_count = 1
         else:
             curr_node.visit_count += 1
+
+        if pred_var_map is not None:
+            self.diffuse_scent(pred_var_map)
         
         # DEBUG: Print current cell info
         print(f"[DEBUG] Current cell: idx={curr_node.index}, centroid={curr_node.center}, "
