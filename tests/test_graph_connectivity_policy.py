@@ -91,3 +91,46 @@ def test_portal_false_negative_falls_back_to_mini_astar():
     node = manager.cells.get((0, 0))
     assert node is not None
     assert any(n.index == (0, 1) for n in node.neighbors)
+
+
+def test_rr_mini_astar_is_local_patch():
+    obs = _free_grid((12, 12), wall_col=None)
+    obs[0:6, 4] = 1.0  # local barrier; gap below local patch
+    pred_mean = np.zeros_like(obs)
+    pred_var = np.zeros_like(obs)
+    inflated = np.full_like(obs, np.inf)  # portal will be False
+
+    manager = _make_manager({
+        "graph_portal_fallback_max_obs_ratio": 0.2,
+        "graph_pred_wall_threshold": 0.7,
+        "graph_unknown_as_occ": True,
+        "graph_dilate_diam": 3,
+    })
+
+    manager.update_graph(
+        robot_pose=np.array([2, 2]),
+        obs_map=obs,
+        pred_mean_map=pred_mean,
+        pred_var_map=pred_var,
+        inflated_occ_grid=inflated,
+    )
+    manager.update_graph(
+        robot_pose=np.array([2, 2]),
+        obs_map=obs,
+        pred_mean_map=pred_mean,
+        pred_var_map=pred_var,
+        inflated_occ_grid=inflated,
+    )
+
+    node = manager.cells.get((0, 0))
+    assert node is not None
+    assert not any(n.index == (0, 1) for n in node.neighbors)
+
+
+def test_los_side_lines_allow_clear_offset():
+    obs = _free_grid((8, 8), wall_col=None)
+    obs[2, 4] = 1.0  # block the exact centroid line only
+
+    manager = _make_manager()
+
+    assert manager._check_path_clear((0, 0), (0, 1), obs)

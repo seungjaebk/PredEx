@@ -46,7 +46,7 @@ from nbh.exploration_config import (
     DELTA_SCALE, CELL_SIZE, WAYPOINT_REACHED_TOLERANCE, WAYPOINT_STALE_STEPS,
     MAX_TARGET_DISTANCE
 )
-from nbh.graph_utils import CellManager
+from nbh.graph_utils import CellManager, parse_debug_edge_samples
 from nbh.flow_planner import load_flow_model
 from nbh.high_level_planner import WaypointState
 from nbh.waypoint_utils import select_waypoint_cell
@@ -65,6 +65,7 @@ from nbh.frontier_utils import (
     determine_local_planner
 )
 from nbh.exploration_config import get_options_dict_from_yml
+from nbh.viz_utils import should_save_graph_map, should_save_viz
 
 # ==============================================================================
 # Utility imports
@@ -228,13 +229,21 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
             "graph_diffuse_on_update": nbh_cfg.get("graph_diffuse_on_update", False),
         }
 
-        connectivity_cfg = {}
+        connectivity_cfg = {
+            "graph_unknown_as_occ": nbh_cfg.get("graph_unknown_as_occ", True),
+            "graph_pred_wall_threshold": nbh_cfg.get("graph_pred_wall_threshold", 0.7),
+            "graph_mini_astar_ttl_steps": nbh_cfg.get("graph_mini_astar_ttl_steps", 10),
+        }
         debug_cfg = {
             "graph_debug_edges": nbh_cfg.get("graph_debug_edges", False),
             "graph_debug_targets": nbh_cfg.get("graph_debug_targets", False),
             "graph_debug_belief": nbh_cfg.get("graph_debug_belief", False),
             "graph_debug_propagation_stats": nbh_cfg.get("graph_debug_propagation_stats", False),
+            "graph_debug_local_astar": nbh_cfg.get("graph_debug_local_astar", False),
+            "graph_debug_los_viz": nbh_cfg.get("graph_debug_los_viz", False),
         }
+        viz_save_every_steps = nbh_cfg.get("viz_save_every_steps", 10)
+        viz_save_on_waypoint_reached = nbh_cfg.get("viz_save_on_waypoint_reached", True)
         
         if USE_ASTAR_FOR_LOCAL:
             print("=" * 60)
@@ -250,6 +259,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
 
         # Planner setup (Mapper, Planner)
         mapper = sim_utils.Mapper(occ_map, lidar_sim_configs, use_distance_transform_for_planning=use_distance_transform_for_planning)
+        los_viz_dir = None
         
         # Initialize Graph Planner (Cell Manager)
         cell_manager = None
@@ -264,6 +274,11 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                 connectivity_cfg=connectivity_cfg,
                 debug_cfg=debug_cfg,
             )
+            debug_edge_samples = parse_debug_edge_samples(
+                nbh_cfg.get("graph_debug_edge_samples")
+            )
+            if debug_edge_samples:
+                cell_manager.debug_edge_samples = debug_edge_samples
             print(f"Initialized NBH Cell Manager (Cell Size: {CELL_SIZE_CONFIG}px = {CELL_SIZE_CONFIG/10}m, Origin: {start_pose})")
             
         if mode != 'upen':
@@ -278,15 +293,26 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         if not os.path.exists(exp_dir):
             os.makedirs(exp_dir)
 
+        save_graph_map = should_save_graph_map(getattr(collect_opts, "save_graph_map", True))
+
         # Create subdirectory (global_obs, run_viz, graph_map) and save paths
         global_obs_dir = os.path.join(exp_dir, 'global_obs')
         run_viz_dir = os.path.join(exp_dir, 'run_viz')
         graph_map_dir = os.path.join(exp_dir, 'graph_map')
-        for dir_path in [global_obs_dir, run_viz_dir, graph_map_dir]:
+        if nbh_cfg.get("graph_debug_los_viz", False):
+            los_viz_dir = os.path.join(exp_dir, 'los_debug')
+        dir_paths = [global_obs_dir, run_viz_dir]
+        if save_graph_map:
+            dir_paths.append(graph_map_dir)
+        if los_viz_dir is not None:
+            dir_paths.append(los_viz_dir)
+        for dir_path in dir_paths:
             if not os.path.exists(dir_path):
                 os.makedirs(dir_path)
         gt_map_save_path = os.path.join(exp_dir, 'gt_map.png')
         odom_npy_save_path = os.path.join(exp_dir, 'odom.npy')
+        if cell_manager is not None and los_viz_dir is not None:
+            cell_manager.los_viz_dir = los_viz_dir
 
         # Flow logging setup
         flow_logging_dir = None
@@ -401,6 +427,8 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         
         # Maximum target distance - don't target centroids too far away
         MAX_TARGET_DISTANCE = 60.0  # pixels (~6m) - keeps targets local and achievable
+
+        printed_local_astar_cfg = False
         
         ### Main Loop
         # Create a timestamp string with date and time, e.g. "20250319_155031"
@@ -443,6 +471,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
             for t in range(time_step):
                 start_mission_i_time = time.time()
                 show_plt = (t % collect_opts.show_plt_freq == 0) or (t == collect_opts.mission_time - 1)
+                waypoint_reached_this_step = False
                 
                 # Frontier detection (flow mode only)
                 if t == 0:
@@ -646,6 +675,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         else:
                             # Waypoint Reached! Clear only the waypoint; keep high-level target
                             print(f"Waypoint Reached! (dist={dist_to_next_wp:.2f}, path_remaining={remaining_cells if 'remaining_cells' in dir() else '?'} cells)")
+                            waypoint_reached_this_step = True
                             current_waypoint = None
                             locked_trajectory = None
                             locked_trajectory_samples = None
@@ -848,6 +878,45 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         # ========== A* LOCAL PLANNER (for debugging high-level) ==========
                         # Use A* to plan from current pose to target cell center
                         target_pose_int = tuple(target_pos.astype(int))
+
+                        if debug_cfg.get("graph_debug_local_astar"):
+                            if not printed_local_astar_cfg:
+                                print(
+                                    "[A* DEBUG] use_distance_transform_for_planning="
+                                    f"{use_distance_transform_for_planning} "
+                                    "dilate_diam_for_planning="
+                                    f"{lidar_sim_configs.get('dilate_diam_for_planning')}"
+                                )
+                                printed_local_astar_cfg = True
+
+                            rr = np.linspace(cur_pose[0], target_pose_int[0], num=10)
+                            cc = np.linspace(cur_pose[1], target_pose_int[1], num=10)
+                            line_cost_samples = []
+                            seen = set()
+                            for r_val, c_val in zip(rr, cc):
+                                r_i = int(round(r_val))
+                                c_i = int(round(c_val))
+                                if (r_i, c_i) in seen:
+                                    continue
+                                seen.add((r_i, c_i))
+                                if (
+                                    0 <= r_i < occ_grid_pyastar.shape[0]
+                                    and 0 <= c_i < occ_grid_pyastar.shape[1]
+                                ):
+                                    cost_val = occ_grid_pyastar[r_i, c_i]
+                                    if np.isinf(cost_val):
+                                        cost_val = "inf"
+                                    else:
+                                        cost_val = float(cost_val)
+                                    line_cost_samples.append((r_i, c_i, cost_val))
+                            print(
+                                "[A* DEBUG] cur_pose="
+                                f"{tuple(cur_pose)} target_pos="
+                                f"{tuple(target_pos)} target_pose_int="
+                                f"{target_pose_int} line_cost_samples="
+                                f"{line_cost_samples}"
+                            )
+
                         astar_path = pyastar2d.astar_path(occ_grid_pyastar, tuple(cur_pose), target_pose_int, allow_diagonal=False)
                         
                         if astar_path is not None and len(astar_path) > 1:
@@ -863,6 +932,8 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             # Store path for visualization
                             path = astar_path
                             print(f"[A* LOCAL] Path found: {len(astar_path)} waypoints to target {target_pose_int}")
+                            if debug_cfg.get("graph_debug_local_astar"):
+                                print(f"[A* DEBUG] astar_path_head={astar_path[:8].tolist()}")
                         else:
                             # A* failed - target unreachable
                             print(f"[A* LOCAL] ⚠️ No path to target {target_pose_int}! Staying in place.")
@@ -1034,6 +1105,15 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         print("\033[94mMission complete for {}!\033[0m".format(exp_title))
                         break
      
+
+                should_save_fig = should_save_viz(
+                    t,
+                    viz_save_every_steps,
+                    viz_save_on_waypoint_reached,
+                    waypoint_reached_this_step,
+                )
+                if should_save_fig:
+                    show_plt = True
 
                 # Visualize
                 start_time = time.time()
@@ -1305,15 +1385,16 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     # plt.pause(0.001)
                     
                     # fig name include experiment title and time step
-                    print("saving fig:", t)
-                    plt.savefig(run_viz_dir + '/{}_{}.png'.format(exp_title, str(t).zfill(8)),dpi=300)
+                    if should_save_fig:
+                        print("saving fig:", t)
+                        plt.savefig(run_viz_dir + '/{}_{}.png'.format(exp_title, str(t).zfill(8)),dpi=300)
                     # print("3d. Visualizing took {} seconds".format(np.round(time.time() - start_time, 2)))
                     # import pdb; pdb.set_trace() 
                     # print("4. Visualizing took {} seconds".format(np.round(time.time() - start_time, 2)))
                     #plt.close()
 
                     # Save detailed graph visualization with scores (baseline-style)
-                    if mode == 'nbh' and cell_manager is not None and show_plt:
+                    if mode == 'nbh' and cell_manager is not None and show_plt and save_graph_map and should_save_fig:
                         fig_graph, ax_graph = plt.subplots(1, 1, figsize=(10, 10))
                         ax_graph.imshow(1-mapper.gt_map[pd_size:-pd_size,pd_size:-pd_size], cmap='gray', vmin=0, vmax=1)
                         visualize_cell_graph(

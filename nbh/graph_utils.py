@@ -1,9 +1,24 @@
+import os
 import numpy as np
 import cv2
 import pyastar2d
 from collections import deque
 
 DEBUG_GRAPH = False
+
+def parse_debug_edge_samples(raw_samples):
+    if not raw_samples:
+        return set()
+    samples = set()
+    for entry in raw_samples:
+        if not entry or len(entry) != 2:
+            continue
+        a, b = entry
+        if a is None or b is None or len(a) != 2 or len(b) != 2:
+            continue
+        key = tuple(sorted([tuple(a), tuple(b)]))
+        samples.add(key)
+    return samples
 
 class CellNode:
     def __init__(self, index, center_pixel, is_ghost=False):
@@ -72,6 +87,9 @@ class CellManager:
         self._last_obs_map = None
         self._last_pred_map = None
         self._last_inflated_sig = None
+        self.debug_edge_samples = set()
+        self.los_viz_dir = None
+        self._los_viz_counter = 0
 
     def _get_cfg(self, key, default):
         return self.promotion_cfg.get(key, default)
@@ -103,6 +121,101 @@ class CellManager:
             self._pred_update_id,
             self._grid_update_id,
         ))
+
+    def _edge_key(self, node_idx, neighbor_idx):
+        return tuple(sorted([node_idx, neighbor_idx]))
+
+    def _collect_line_samples(self, node_idx, neighbor_idx, obs_map):
+        centroid1 = self.get_cell_center(node_idx)
+        centroid2 = self.get_cell_center(neighbor_idx)
+        num_samples = self.cell_size
+        samples = []
+
+        for i in range(num_samples + 1):
+            t = i / num_samples
+            r = int(centroid1[0] * (1 - t) + centroid2[0] * t)
+            c = int(centroid1[1] * (1 - t) + centroid2[1] * t)
+            if 0 <= r < obs_map.shape[0] and 0 <= c < obs_map.shape[1]:
+                samples.append((r, c, float(obs_map[r, c])))
+            else:
+                samples.append((r, c, None))
+        return samples
+
+    def _trace_los_line(self, centroid1, centroid2, obs_map, offset_r=0, offset_c=0):
+        num_samples = self.cell_size
+        points = []
+        has_sample = False
+        blocked = False
+
+        for i in range(num_samples + 1):
+            t = i / num_samples
+            r = int(centroid1[0] * (1 - t) + centroid2[0] * t) + offset_r
+            c = int(centroid1[1] * (1 - t) + centroid2[1] * t) + offset_c
+            if 0 <= r < obs_map.shape[0] and 0 <= c < obs_map.shape[1]:
+                has_sample = True
+                val = float(obs_map[r, c])
+                points.append((r, c, val))
+                if val >= 0.8:
+                    blocked = True
+
+        return points, (has_sample and not blocked)
+
+    def _save_los_debug_plot(self, node_idx, neighbor_idx, obs_map, line_results):
+        if not self.los_viz_dir:
+            return
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            return
+
+        centroid1 = self.get_cell_center(node_idx)
+        centroid2 = self.get_cell_center(neighbor_idx)
+        rows = [centroid1[0], centroid2[0]]
+        cols = [centroid1[1], centroid2[1]]
+        for line in line_results:
+            for r, c, _ in line["points"]:
+                rows.append(r)
+                cols.append(c)
+
+        margin = int(self.cell_size * 2)
+        r_min = max(int(min(rows) - margin), 0)
+        r_max = min(int(max(rows) + margin), obs_map.shape[0] - 1)
+        c_min = max(int(min(cols) - margin), 0)
+        c_max = min(int(max(cols) + margin), obs_map.shape[1] - 1)
+
+        crop = obs_map[r_min:r_max + 1, c_min:c_max + 1]
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+        ax.imshow(crop, cmap="gray", vmin=0, vmax=1)
+
+        for line in line_results:
+            points = line["points"]
+            if not points:
+                continue
+            color = "blue" if line["clear"] else "red"
+            xs = [p[1] - c_min for p in points]
+            ys = [p[0] - r_min for p in points]
+            ax.plot(xs, ys, color=color, linewidth=2)
+
+        ax.scatter(
+            [centroid1[1] - c_min, centroid2[1] - c_min],
+            [centroid1[0] - r_min, centroid2[0] - r_min],
+            c="cyan",
+            s=30,
+            marker="o",
+            edgecolors="black",
+            linewidths=0.5,
+        )
+        ax.set_title(f"LOS {node_idx} <-> {neighbor_idx}")
+        ax.axis("off")
+
+        filename = (
+            f"los_{node_idx[0]}_{node_idx[1]}_"
+            f"{neighbor_idx[0]}_{neighbor_idx[1]}_"
+            f"{self._los_viz_counter:04d}.png"
+        )
+        fig.savefig(os.path.join(self.los_viz_dir, filename), dpi=200)
+        plt.close(fig)
+        self._los_viz_counter += 1
 
     def get_cell_index(self, pixel_pose):
         """
@@ -374,6 +487,62 @@ class CellManager:
         self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
         return result[0], result[1], result[2], "miss", cache_ttl
 
+    def _run_mini_astar_local_rr(self, node_idx, neighbor_idx, obs_map):
+        cache_ttl = self.connectivity_cfg.get("graph_mini_astar_ttl_steps", 10)
+        policy_hash = self._grid_policy_hash()
+        cache_key = (node_idx, neighbor_idx, "RR", "local", policy_hash)
+
+        entry = self._mini_astar_cache.get(cache_key)
+        if entry is not None:
+            ok, path_len, reason, last_step = entry
+            ttl_left = cache_ttl - (self._mini_astar_step - last_step)
+            if ttl_left > 0:
+                return ok, path_len, reason, "hit", ttl_left
+
+        c1 = self.get_cell_center(node_idx)
+        c2 = self.get_cell_center(neighbor_idx)
+
+        half_cell = self.cell_size // 2
+        half_patch = 2 * half_cell
+        min_r = int(min(c1[0], c2[0]) - half_patch)
+        max_r = int(max(c1[0], c2[0]) + half_patch)
+        min_c = int(min(c1[1], c2[1]) - half_patch)
+        max_c = int(max(c1[1], c2[1]) + half_patch)
+
+        map_h, map_w = obs_map.shape
+        min_r = max(0, min_r)
+        max_r = min(map_h, max_r)
+        min_c = max(0, min_c)
+        max_c = min(map_w, max_c)
+
+        if min_r >= max_r or min_c >= max_c:
+            result = (False, 0, "empty_patch")
+            self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
+            return result[0], result[1], result[2], "miss", cache_ttl
+
+        local_patch = obs_map[min_r:max_r, min_c:max_c]
+        start_local = (int(c1[0] - min_r), int(c1[1] - min_c))
+        end_local = (int(c2[0] - min_r), int(c2[1] - min_c))
+
+        if not (0 <= start_local[0] < local_patch.shape[0] and 0 <= start_local[1] < local_patch.shape[1]):
+            result = (False, 0, "out_of_bounds")
+            self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
+            return result[0], result[1], result[2], "miss", cache_ttl
+        if not (0 <= end_local[0] < local_patch.shape[0] and 0 <= end_local[1] < local_patch.shape[1]):
+            result = (False, 0, "out_of_bounds")
+            self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
+            return result[0], result[1], result[2], "miss", cache_ttl
+
+        cost = self._build_cost_grid(local_patch, None, edge_type="RR")
+        path = pyastar2d.astar_path(cost, start_local, end_local, allow_diagonal=False)
+        if path is None:
+            result = (False, 0, "no_path")
+        else:
+            result = (True, int(path.shape[0]), "ok")
+
+        self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
+        return result[0], result[1], result[2], "miss", cache_ttl
+
     def _boundary_wall_ratio(self, obs_map, node_idx, neighbor_idx):
         centroid1 = self.get_cell_center(node_idx)
         centroid2 = self.get_cell_center(neighbor_idx)
@@ -399,6 +568,10 @@ class CellManager:
         return self._boundary_wall_ratio(obs_map, node_idx, neighbor_idx) <= max_ratio
 
     def _check_rr_edge(self, node_idx, neighbor_idx, obs_map, pred_mean_map, free_mask):
+        edge_key = self._edge_key(node_idx, neighbor_idx)
+        if edge_key in self.debug_edge_samples:
+            samples = self._collect_line_samples(node_idx, neighbor_idx, obs_map)
+            print(f"[RR DEBUG] edge={edge_key} line_samples={samples}")
         portal_ok = False
         if free_mask is not None:
             thickness = self.connectivity_cfg.get("graph_portal_thickness", 2)
@@ -415,9 +588,8 @@ class CellManager:
             }
 
         if portal_ok and not los_ok:
-            cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type="RR")
-            ok, path_len, reason, cache_status, ttl_left = self._run_mini_astar(
-                node_idx, neighbor_idx, cost, "RR"
+            ok, path_len, reason, cache_status, ttl_left = self._run_mini_astar_local_rr(
+                node_idx, neighbor_idx, obs_map
             )
             return ok, {
                 "portal": True,
@@ -428,9 +600,8 @@ class CellManager:
             }
 
         if not portal_ok and self._should_fallback_when_portal_false(obs_map, node_idx, neighbor_idx):
-            cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type="RR")
-            ok, path_len, reason, cache_status, ttl_left = self._run_mini_astar(
-                node_idx, neighbor_idx, cost, "RR"
+            ok, path_len, reason, cache_status, ttl_left = self._run_mini_astar_local_rr(
+                node_idx, neighbor_idx, obs_map
             )
             return ok, {
                 "portal": False,
@@ -483,27 +654,44 @@ class CellManager:
         
         Returns True if passage is possible, False if blocked.
         """
-        # Get absolute pixel coordinates of cell centroids
         centroid1 = self.get_cell_center(node_idx)
         centroid2 = self.get_cell_center(neighbor_idx)
-        
-        # Sample points along the line between centroids
-        num_samples = self.cell_size
-        for i in range(num_samples + 1):
-            t = i / num_samples
-            r = int(centroid1[0] * (1 - t) + centroid2[0] * t)
-            c = int(centroid1[1] * (1 - t) + centroid2[1] * t)
-            
-            # Check if point is within map bounds
-            if 0 <= r < obs_map.shape[0] and 0 <= c < obs_map.shape[1]:
-                obs_val = obs_map[r, c]
-                
-                # Block on observed wall
-                if obs_val >= 0.8:
-                    return False
-                
-        # Centroid line is clear
-        return True
+        edge_key = self._edge_key(node_idx, neighbor_idx)
+        want_viz = (
+            self.debug_cfg.get("graph_debug_los_viz", False)
+            and edge_key in self.debug_edge_samples
+            and self.los_viz_dir
+        )
+        line_results = []
+        points, clear = self._trace_los_line(centroid1, centroid2, obs_map)
+        line_results.append({"offset": (0, 0), "points": points, "clear": clear})
+        if clear and not want_viz:
+            return True
+
+        dr = neighbor_idx[0] - node_idx[0]
+        dc = neighbor_idx[1] - node_idx[1]
+        if dr == 0 and dc != 0:
+            offsets = [(-1, 0), (1, 0)]
+        elif dc == 0 and dr != 0:
+            offsets = [(0, -1), (0, 1)]
+        else:
+            if want_viz:
+                self._save_los_debug_plot(node_idx, neighbor_idx, obs_map, line_results)
+            return False
+        overall_ok = clear
+        for off_r, off_c in offsets:
+            points, clear = self._trace_los_line(
+                centroid1, centroid2, obs_map, offset_r=off_r, offset_c=off_c
+            )
+            line_results.append({"offset": (off_r, off_c), "points": points, "clear": clear})
+            if clear and not want_viz:
+                return True
+            overall_ok = overall_ok or clear
+
+        if want_viz:
+            self._save_los_debug_plot(node_idx, neighbor_idx, obs_map, line_results)
+
+        return overall_ok
 
     def _check_portal_clear(self, node_idx, neighbor_idx, free_mask, thickness=2):
         """
@@ -732,76 +920,6 @@ class CellManager:
         if DEBUG_GRAPH:
             print(f"[DEBUG] Current cell: idx={curr_node.index}, centroid={curr_node.center}, "
                   f"obs_map.shape={obs_map.shape}, robot_pose={robot_pose}")
-
-    def get_best_target_cell(self, pred_var_map, obs_map):
-        """Select next cell based on Diffused Scent."""
-        # 1. Run Diffusion
-        self.diffuse_scent(pred_var_map)
-        
-        if self.current_cell is None: return None, "INIT"
-        
-        # 2. Score Neighbors
-        best_score = -1e9
-        best_node = None
-        
-        # Look at graph neighbors
-        valid_moves = []
-        
-        for neighbor in self.current_cell.neighbors:
-            if neighbor.is_blocked: continue
-            
-            # --- CENTER VALIDITY CHECK ---
-            # A cell might not be "blocked" overall, but its CENTER could be on/near a wall.
-            # Check if the center area is actually in free space.
-            center_r, center_c = int(neighbor.center[0]), int(neighbor.center[1])
-            
-            # Check a small patch around center for walls (more strict near doors)
-            buffer = 3  # Check 7x7 area (±3 pixels)
-            r_min = max(0, center_r - buffer)
-            r_max = min(obs_map.shape[0], center_r + buffer + 1)
-            c_min = max(0, center_c - buffer)
-            c_max = min(obs_map.shape[1], center_c + buffer + 1)
-            
-            center_patch = obs_map[r_min:r_max, c_min:c_max]
-            if center_patch.size > 0:
-                wall_ratio = np.mean(center_patch == 1.0)
-                if wall_ratio > 0.15:  # stricter: skip centers near walls
-                    # print(f"Skipping cell {neighbor.index}: center near wall ({wall_ratio*100:.0f}%)")
-                    continue
-            
-            # Score = Propagated Scent - Visit Penalty
-            # We want to follow the high values
-            score = neighbor.propagated_value
-            
-            # Penalty for re-visiting (Anti-Loop)
-            if neighbor.visited:
-                # If it's just a transit node, penalty is small.
-                # If it's a dead end we stuck in, penalty grows.
-                score /= (1.0 + 0.5 * neighbor.visit_count)
-            
-            valid_moves.append((score, neighbor))
-            
-            if score > best_score:
-                best_score = score
-                best_node = neighbor
-        
-        # 3. Decision
-        # If best option is terrible (low value), Backtrack
-        # Threshold depends on scale of variance. 
-        # If base_value is ~100 (sum of variance), propagated is high.
-        # If 0, then 0.
-        
-        if best_node is not None and best_score > 1.0:
-            return best_node, f"FLOW(Val={best_score:.1f})"
-        else:
-            # Backtrack
-            if self.current_cell.parent:
-                return self.current_cell.parent, "BACKTRACK"
-            elif self.visited_stack:
-                return self.visited_stack[-1], "STACK_JUMP"
-            else:
-                # Stuck
-                return None, "STUCK"
 
     # ========================================================================
     # HYBRID NAVIGATION: Goal Gradient + Local Greedy
