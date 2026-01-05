@@ -37,6 +37,48 @@ FLOW_NUM_STEPS = 10  # ODE integration steps
 TRAJECTORY_NUM_SAMPLES = 50  # Number of trajectory samples
 GOAL_PERTURB_STD = 0.5  # Radians (~30°) for trajectory diversity
 
+# ============================================================================
+# GRAPH UPDATE MODE CONSTANTS
+# ============================================================================
+GRAPH_UPDATE_MODE_DEFAULT = "target_change"
+GRAPH_UPDATE_MODES = ("full", "target_change", "light_only")
+
+
+def _get_cfg_value(cfg, key, default):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    getter = getattr(cfg, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return getattr(cfg, key, default)
+
+
+def get_graph_update_mode(nbh_cfg):
+    mode = _get_cfg_value(nbh_cfg, "graph_update_mode", GRAPH_UPDATE_MODE_DEFAULT)
+    if mode is None:
+        mode = GRAPH_UPDATE_MODE_DEFAULT
+    if mode not in GRAPH_UPDATE_MODES:
+        raise ValueError(f"Invalid graph_update_mode: {mode}")
+    return mode
+
+
+def should_run_full_update(mode, has_graph, need_new_target):
+    if mode == "full":
+        return True
+    if mode == "target_change":
+        return bool(need_new_target)
+    if mode == "light_only":
+        return not bool(has_graph)
+    raise ValueError(f"Invalid graph_update_mode: {mode}")
+
+
+def should_run_light_update(mode):
+    if mode not in GRAPH_UPDATE_MODES:
+        raise ValueError(f"Invalid graph_update_mode: {mode}")
+    return mode in ("target_change", "light_only")
+
 
 def get_options_dict_from_yml(config_name):
     """Load configuration from YAML file using Hydra."""

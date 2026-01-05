@@ -44,7 +44,8 @@ from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 # ==============================================================================
 from nbh.exploration_config import (
     DELTA_SCALE, CELL_SIZE, WAYPOINT_REACHED_TOLERANCE, WAYPOINT_STALE_STEPS,
-    MAX_TARGET_DISTANCE
+    MAX_TARGET_DISTANCE, get_graph_update_mode, should_run_full_update,
+    should_run_light_update
 )
 from nbh.graph_utils import CellManager, parse_debug_edge_samples
 from nbh.flow_planner import load_flow_model
@@ -233,6 +234,8 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
             "graph_unknown_as_occ": nbh_cfg.get("graph_unknown_as_occ", True),
             "graph_pred_wall_threshold": nbh_cfg.get("graph_pred_wall_threshold", 0.7),
             "graph_mini_astar_ttl_steps": nbh_cfg.get("graph_mini_astar_ttl_steps", 10),
+            "graph_edge_risk_strip_divisor": nbh_cfg.get("graph_edge_risk_strip_divisor", 6),
+            "graph_edge_risk_eps": nbh_cfg.get("graph_edge_risk_eps", 1e-4),
         }
         debug_cfg = {
             "graph_debug_edges": nbh_cfg.get("graph_debug_edges", False),
@@ -242,6 +245,11 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
             "graph_debug_local_astar": nbh_cfg.get("graph_debug_local_astar", False),
             "graph_debug_los_viz": nbh_cfg.get("graph_debug_los_viz", False),
         }
+        # Graph update policy:
+        # - full: full update every step
+        # - target_change: light update every step; full update only when reselecting target
+        # - light_only: one-time full init; then light updates only
+        graph_update_mode = get_graph_update_mode(nbh_cfg)
         viz_save_every_steps = nbh_cfg.get("viz_save_every_steps", 10)
         viz_save_on_waypoint_reached = nbh_cfg.get("viz_save_on_waypoint_reached", True)
         
@@ -587,19 +595,42 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         raise ValueError("Flow planner selected but flow model is not available")
                     
                     # --- GRAPH FLOW LOGIC ---
-                    # Update Graph with current observation AND prediction (for Ghosts)
                     # Align prediction maps to obs_map size; pad unknown outside.
                     obs_h, obs_w = mapper.obs_map.shape
                     unpadded_pred_mean = align_pred_map(latest_pred_mean_map, (obs_h, obs_w), fill_value=0.5)
                     unpadded_pred_var = align_pred_map(latest_pred_var_map, (obs_h, obs_w), fill_value=1.0)
-                    
-                    cell_manager.update_graph(
-                        cur_pose, 
-                        mapper.obs_map, 
-                        unpadded_pred_mean, # Cropped to match obs_map coordinates
-                        pred_var_map=unpadded_pred_var,  # Cropped to match obs_map coordinates
-                        inflated_occ_grid=occ_grid_pyastar
-                    )
+
+                    has_graph = cell_manager.last_obs_shape is not None
+                    did_full_update = False
+
+                    if graph_update_mode == "full":
+                        cell_manager.update_graph(
+                            cur_pose,
+                            mapper.obs_map,
+                            unpadded_pred_mean,  # Cropped to match obs_map coordinates
+                            pred_var_map=unpadded_pred_var,  # Cropped to match obs_map coordinates
+                            inflated_occ_grid=occ_grid_pyastar,
+                        )
+                        did_full_update = True
+                    elif graph_update_mode == "light_only":
+                        if should_run_full_update(
+                            graph_update_mode,
+                            has_graph=has_graph,
+                            need_new_target=False,
+                        ):
+                            cell_manager.update_graph(
+                                cur_pose,
+                                mapper.obs_map,
+                                unpadded_pred_mean,  # Cropped to match obs_map coordinates
+                                pred_var_map=unpadded_pred_var,  # Cropped to match obs_map coordinates
+                                inflated_occ_grid=occ_grid_pyastar,
+                            )
+                            did_full_update = True
+                        elif should_run_light_update(graph_update_mode):
+                            cell_manager.update_graph_light(cur_pose)
+                    else:
+                        if should_run_light_update(graph_update_mode):
+                            cell_manager.update_graph_light(cur_pose)
 
                     if debug_cfg.get("graph_debug_propagation_stats") and cell_manager.cells:
                         values = np.array(
@@ -726,6 +757,22 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             reasons_str = ", ".join(target_change_reasons)
                             if debug_cfg.get("graph_debug_targets"):
                                 print(f"[HIGH-LEVEL] Reselecting target (reason: {reasons_str})")
+                            if (
+                                not did_full_update
+                                and should_run_full_update(
+                                    graph_update_mode,
+                                    has_graph=has_graph,
+                                    need_new_target=True,
+                                )
+                            ):
+                                cell_manager.update_graph(
+                                    cur_pose,
+                                    mapper.obs_map,
+                                    unpadded_pred_mean,
+                                    pred_var_map=unpadded_pred_var,
+                                    inflated_occ_grid=occ_grid_pyastar,
+                                )
+                                did_full_update = True
                             # Find best ghost cell (highest uncertainty) that is REACHABLE from current cell
                             exploration_target = cell_manager.find_exploration_target(
                                 latest_pred_var_map if latest_pred_var_map is not None else np.zeros_like(mapper.obs_map),

@@ -87,6 +87,8 @@ class CellManager:
         self._last_obs_map = None
         self._last_pred_map = None
         self._last_inflated_sig = None
+        self.edge_costs = {}
+        self._p_occ_map = None
         self.debug_edge_samples = set()
         self.los_viz_dir = None
         self._los_viz_counter = 0
@@ -280,6 +282,9 @@ class CellManager:
         centroid_blocked_threshold = self._get_cfg("graph_centroid_blocked_threshold", 0.8)
         pred_mean_free_threshold = self._get_cfg("graph_ghost_pred_mean_free_threshold", 0.4)
         pred_var_max_threshold = self._get_cfg("graph_ghost_pred_var_max_threshold", 0.3)
+
+        self._p_occ_map = self._compute_p_occ(obs_map, pred_mean_map, pred_var_map)
+        self.edge_costs = {}
         
         # --- 1. UPDATE REAL NODES (Observed) ---
         # Expand from existing cells + their neighbors
@@ -450,6 +455,11 @@ class CellManager:
                         )
                         if ok:
                             node.neighbors.append(neighbor)
+                            edge_key = self._edge_key(idx, (nr, nc))
+                            if edge_key not in self.edge_costs:
+                                self.edge_costs[edge_key] = self._edge_risk_cost(
+                                    idx, (nr, nc), self._p_occ_map
+                                )
     
     def _build_cost_grid(self, obs_map, pred_mean_map=None, edge_type="RR"):
         unknown_as_occ = self.connectivity_cfg.get("graph_unknown_as_occ", True)
@@ -767,6 +777,107 @@ class CellManager:
 
         return False
 
+    def _compute_p_occ(self, obs_map, pred_mean_map, pred_var_map, eps=1e-4, k=2.0, sigma_max=0.5):
+        p_occ = np.zeros_like(obs_map, dtype=np.float32)
+
+        observed_free = (obs_map == 0.0)
+        observed_occ = (obs_map == 1.0)
+        unknown = (obs_map == 0.5)
+
+        p_occ[observed_free] = 0.0
+        p_occ[observed_occ] = 1.0
+
+        if pred_mean_map is None or pred_var_map is None:
+            p_occ[unknown] = 0.5
+            return p_occ
+
+        pred_mean_map = self._align_pred_map(pred_mean_map, obs_map.shape, fill_value=1.0)
+        pred_var_map = self._align_pred_map(pred_var_map, obs_map.shape, fill_value=sigma_max * sigma_max)
+
+        m = np.clip(pred_mean_map, eps, 1.0 - eps)
+        sigma = np.sqrt(np.clip(pred_var_map, 0.0, sigma_max * sigma_max))
+        s = np.exp(-k * sigma * sigma)
+
+        logit = np.log(m / (1.0 - m))
+        m_cal = 1.0 / (1.0 + np.exp(-s * logit))
+
+        p_occ[unknown] = m_cal[unknown]
+        return p_occ
+
+    def _edge_risk_cost(self, node_idx, neighbor_idx, p_occ_map):
+        if p_occ_map is None:
+            return 1.0
+
+        strip_div = max(1, int(self.connectivity_cfg.get("graph_edge_risk_strip_divisor", 6)))
+        eps = float(self.connectivity_cfg.get("graph_edge_risk_eps", 1e-4))
+        thickness = max(1, int(self.cell_size // strip_div))
+
+        h, w = p_occ_map.shape
+        a_center = self.get_cell_center(node_idx).astype(int)
+        b_center = self.get_cell_center(neighbor_idx).astype(int)
+        half = self.cell_size // 2
+
+        a_r0 = max(0, int(a_center[0] - half))
+        a_r1 = min(h, int(a_center[0] + half))
+        a_c0 = max(0, int(a_center[1] - half))
+        a_c1 = min(w, int(a_center[1] + half))
+
+        b_r0 = max(0, int(b_center[0] - half))
+        b_r1 = min(h, int(b_center[0] + half))
+        b_c0 = max(0, int(b_center[1] - half))
+        b_c1 = min(w, int(b_center[1] + half))
+
+        dr = neighbor_idx[0] - node_idx[0]
+        dc = neighbor_idx[1] - node_idx[1]
+
+        total = 0.0
+        count = 0
+
+        if dr == 0 and dc == 1:
+            a_strip = p_occ_map[a_r0:a_r1, max(a_c1 - thickness, a_c0):a_c1]
+            b_strip = p_occ_map[b_r0:b_r1, b_c0:min(b_c0 + thickness, b_c1)]
+            if a_strip.size:
+                total += float(np.sum(a_strip))
+                count += int(a_strip.size)
+            if b_strip.size:
+                total += float(np.sum(b_strip))
+                count += int(b_strip.size)
+        elif dr == 0 and dc == -1:
+            a_strip = p_occ_map[a_r0:a_r1, a_c0:min(a_c0 + thickness, a_c1)]
+            b_strip = p_occ_map[b_r0:b_r1, max(b_c1 - thickness, b_c0):b_c1]
+            if a_strip.size:
+                total += float(np.sum(a_strip))
+                count += int(a_strip.size)
+            if b_strip.size:
+                total += float(np.sum(b_strip))
+                count += int(b_strip.size)
+        elif dr == 1 and dc == 0:
+            a_strip = p_occ_map[max(a_r1 - thickness, a_r0):a_r1, a_c0:a_c1]
+            b_strip = p_occ_map[b_r0:min(b_r0 + thickness, b_r1), b_c0:b_c1]
+            if a_strip.size:
+                total += float(np.sum(a_strip))
+                count += int(a_strip.size)
+            if b_strip.size:
+                total += float(np.sum(b_strip))
+                count += int(b_strip.size)
+        elif dr == -1 and dc == 0:
+            a_strip = p_occ_map[a_r0:min(a_r0 + thickness, a_r1), a_c0:a_c1]
+            b_strip = p_occ_map[max(b_r1 - thickness, b_r0):b_r1, b_c0:b_c1]
+            if a_strip.size:
+                total += float(np.sum(a_strip))
+                count += int(a_strip.size)
+            if b_strip.size:
+                total += float(np.sum(b_strip))
+                count += int(b_strip.size)
+
+        if count == 0:
+            return float(-np.log(max(eps, 1e-12)))
+
+        mean_occ = total / float(count)
+        mean_occ = float(np.clip(mean_occ, 0.0, 1.0))
+        p_free = max(1.0 - mean_occ, eps)
+        return float(-np.log(p_free))
+
     def _align_pred_map(self, pred_map, obs_shape, fill_value=1.0):
         if pred_map is None or obs_shape is None:
             return pred_map
@@ -856,6 +967,33 @@ class CellManager:
                 self.cells[idx].propagated_value = val
         
         # Note: scent_map_vis is no longer used (indices can be negative now)
+
+    def update_graph_light(self, robot_pose):
+        """Update only current cell/visit state without rebuilding the graph."""
+        if self.origin is None:
+            self.origin = np.array(robot_pose, dtype=float)
+            print(f"[GRAPH] Origin set to robot start: {self.origin}")
+        self._mini_astar_step += 1
+
+        # Update current position
+        curr_idx = self.get_cell_index(robot_pose)
+        curr_node = self.get_cell(curr_idx)
+
+        # Update parent/stack for backtracking
+        if self.current_cell is not None and self.current_cell.index != curr_idx:
+            if curr_node.parent is None and curr_node != self.current_cell.parent:
+                curr_node.parent = self.current_cell
+                self.visited_stack.append(self.current_cell)
+            elif curr_node == self.current_cell.parent:
+                if self.visited_stack:
+                    self.visited_stack.pop()
+
+        self.current_cell = curr_node
+        if not curr_node.visited:
+            curr_node.visited = True
+            curr_node.visit_count = 1
+        else:
+            curr_node.visit_count += 1
 
     def update_graph(self, robot_pose, obs_map, pred_mean_map=None, pred_var_map=None, inflated_occ_grid=None):
         """Main update loop called by agent."""
@@ -1131,7 +1269,7 @@ class CellManager:
 
     def find_path_to_target(self, start_cell, target_cell):
         """
-        Find path from start_cell to target_cell using BFS.
+        Find path from start_cell to target_cell using Dijkstra (risk cost).
         
         Returns:
             path: list of CellNodes from start to target (inclusive)
@@ -1144,35 +1282,50 @@ class CellManager:
         if start_cell.index == target_cell.index:
             return [start_cell]
         
-        from collections import deque
-        
-        # BFS
-        queue = deque([(start_cell, [start_cell])])
-        visited = {start_cell.index}
-        
-        while queue:
-            current, path = queue.popleft()
-            
-            for neighbor in current.neighbors:
-                if neighbor.index in visited:
-                    continue
+        import heapq
+
+        dist = {start_cell.index: 0.0}
+        prev = {}
+        heap = [(0.0, start_cell.index)]
+        visited = set()
+
+        while heap:
+            curr_cost, curr_idx = heapq.heappop(heap)
+            if curr_idx in visited:
+                continue
+            visited.add(curr_idx)
+
+            if curr_idx == target_cell.index:
+                break
+
+            curr_node = self.cells.get(curr_idx)
+            if curr_node is None:
+                continue
+
+            for neighbor in curr_node.neighbors:
                 if neighbor.is_blocked:
                     continue
-                
-                new_path = path + [neighbor]
-                
-                if neighbor.index == target_cell.index:
-                    # Path found! Print the path
-                    path_str = " → ".join([f"{c.index}" for c in new_path])
-                    print(f"  [PATH] Found: {path_str} ({len(new_path)} cells)")
-                    return new_path
-                
-                visited.add(neighbor.index)
-                queue.append((neighbor, new_path))
-        
-        # No path found - debug why
-        print(f"  [PATH] NO PATH from {start_cell.index} to {target_cell.index}!")
-        print(f"         Start neighbors: {[n.index for n in start_cell.neighbors]}")
-        print(f"         Target neighbors: {[n.index for n in target_cell.neighbors]}")
-        print(f"         Visited {len(visited)} cells, target not reachable")
-        return None  # No path found
+                edge_key = self._edge_key(curr_idx, neighbor.index)
+                edge_cost = self.edge_costs.get(edge_key, 1.0)
+                new_cost = curr_cost + edge_cost
+                if new_cost < dist.get(neighbor.index, float("inf")):
+                    dist[neighbor.index] = new_cost
+                    prev[neighbor.index] = curr_idx
+                    heapq.heappush(heap, (new_cost, neighbor.index))
+
+        if target_cell.index not in dist:
+            print(f"  [PATH] NO PATH from {start_cell.index} to {target_cell.index}!")
+            print(f"         Start neighbors: {[n.index for n in start_cell.neighbors]}")
+            print(f"         Target neighbors: {[n.index for n in target_cell.neighbors]}")
+            print(f"         Visited {len(visited)} cells, target not reachable")
+            return None
+
+        path_indices = [target_cell.index]
+        while path_indices[-1] != start_cell.index:
+            path_indices.append(prev[path_indices[-1]])
+        path_indices.reverse()
+        path = [self.cells[idx] for idx in path_indices]
+
+        path_str = " → ".join([f"{c.index}" for c in path])
+        print(f"  [PATH] Found: {path_str} ({len(path)} cells, cost={dist[target_cell.index]:.3f})")
+        return path

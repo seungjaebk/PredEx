@@ -13,19 +13,20 @@
 # - 50037764_PLAN1 (7764_PLAN1)
 # - 50037765_PLAN3 (7765_PLAN3)
 # - 50052748 (2748)
+# ============================================================================
+# DATASET / EXPERIMENT SETUP
+# ============================================================================
 collect_world_list: ['50052749']
 output_folder_name: 'experiments'
-
 start_pose: [818, 580]
 
 #modes_to_test: ['nearest', 'nbv-2d', 'onlyvar', 'visunk', 'visvar', 'mapex', 'upen', 'hectoraug', 'pipe', 'pw-nbv-2d'] #all methods
 modes_to_test: ['nbh']
-
 log_iou: false
 mission_time: 1000
 
 # ============================================================================
-# GRAPH-FLOW PLANNER CONFIG
+# PLANNER MODE
 # ============================================================================
 # Local planner mode: 'astar' for debugging high-level, 'flow' for production
 local_planner: 'astar'  # Options: 'astar', 'flow'
@@ -35,21 +36,38 @@ local_planner: 'astar'  # Options: 'astar', 'flow'
 cell_size: 25
 
 nbh:
+  # Ghost creation / promotion
   graph_max_ghost_distance: 2
   graph_obs_blocked_ratio: 0.3
   graph_unknown_ratio_threshold: 0.5
   graph_centroid_blocked_threshold: 0.8
   graph_ghost_pred_mean_free_threshold: 0.4
   graph_ghost_pred_var_max_threshold: 0.3
+
+  # Connectivity / collision
   graph_unknown_as_occ: true
   graph_pred_wall_threshold: 0.7
   graph_mini_astar_ttl_steps: 10
+
+  # Edge risk
+  graph_edge_risk_strip_divisor: 6
+  graph_edge_risk_eps: 1e-4
+
+  # Graph update policy:
+  # - full: full graph update every step (structure + risk + cache + current cell)
+  # - target_change: light update every step; full update only when reselecting target
+  # - light_only: one-time full init; then light updates only (fastest, staler graph)
+  graph_update_mode: target_change
+
+  # Diffusion
   graph_diffuse_gamma: 0.95
   graph_diffuse_iterations: 50
   graph_diffuse_on_update: false
+
+  # Debug
   graph_debug_edges: false
   graph_debug_edge_samples:
-    - [[-8, 11], [-9, 11]]
+    # - [[-8, 11], [-9, 11]]
     # - [[-1, 12], [-2, 12]]
     # - [[-1, 13], [-2, 13]]
   graph_debug_targets: false
@@ -57,10 +75,15 @@ nbh:
   graph_debug_propagation_stats: false
   graph_debug_local_astar: false
   graph_debug_los_viz: true
+
+  # Visualization
   viz_save_every_steps: 10
   viz_save_on_waypoint_reached: true
 save_graph_map: true
 
+# ============================================================================
+# FLOW LOGGING
+# ============================================================================
 flow_logging:
   enabled: true
   save_every: 1          # log every N planner steps
@@ -68,12 +91,17 @@ flow_logging:
   include_prediction: true
   output_dir: 'flow_datasets'
 
+# ============================================================================
+# MODEL DEVICE
+# ============================================================================
 lama_device: 'cuda:0'  # For GPU mode
 #lama_device: 'cpu'      # For CPU mode
 
 ######################### Do not change below this line #########################
 
-# Evaluation runs
+# ============================================================================
+# EVALUATION
+# ============================================================================
 # Note: root_path is auto-detected from script location
 num_data_per_world: 1
 
@@ -81,6 +109,9 @@ unknown_as_occ: true
 use_distance_transform_for_planning: true
 cur_pose_dist_threshold_m: 1
 
+# ============================================================================
+# UPEN CONFIG
+# ============================================================================
 upen_config:
   rrt_max_iters: 2500
   expand_dis: 5
@@ -91,12 +122,18 @@ upen_config:
   reach_horizon: 50
   goal_pose_freq: 10
 
+# ============================================================================
+# LIDAR SIMULATION
+# ============================================================================
 lidar_sim_configs:
   laser_range_m: 20
   num_laser: 2500
   pixel_per_meter: 10
   dilate_diam_for_planning: 3
 
+# ============================================================================
+# PREDICTION VISUALIZATION
+# ============================================================================
 pred_vis_configs:
   laser_range_m: 20
   pixel_per_meter: 10
@@ -107,6 +144,9 @@ show_plt_freq: 50
 
 max_workers: 1
 
+# ============================================================================
+# MODEL WEIGHTS
+# ============================================================================
 ensemble_folder_name: 'weights/lama_ensemble'
 
 # Number of spatial classes in the output
