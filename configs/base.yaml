@@ -53,6 +53,9 @@ nbh:
   graph_edge_risk_strip_divisor: 6
   graph_edge_risk_eps: 1e-4
 
+  # Target scoring
+  graph_target_risk_lambda: 0.5
+
   # Graph update policy:
   # - full: full graph update every step (structure + risk + cache + current cell)
   # - target_change: light update every step; full update only when reselecting target

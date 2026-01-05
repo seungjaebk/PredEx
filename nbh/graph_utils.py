@@ -89,6 +89,7 @@ class CellManager:
         self._last_inflated_sig = None
         self.edge_costs = {}
         self._p_occ_map = None
+        self._dijkstra_cache = None  # (start_idx, dist, prev)
         self.debug_edge_samples = set()
         self.los_viz_dir = None
         self._los_viz_counter = 0
@@ -1025,6 +1026,7 @@ class CellManager:
             self._grid_update_id += 1
             self._mini_astar_cache.clear()
         self._last_inflated_sig = inflated_sig
+        self._dijkstra_cache = None
         
         # 1. Update structure (Real + Ghost nodes)
         free_mask = None
@@ -1220,73 +1222,64 @@ class CellManager:
             target_cell: Best reachable cell to explore (ghost or real), or None if none found
         """
         best_cell = None
-        best_value = -1e9
+        best_score = -1e9
         
         # Run diffusion first to get propagated values
         pred_var_map = self._align_pred_map(pred_var_map, self.last_obs_shape)
         self.diffuse_scent(pred_var_map)
         
-        # Find all cells reachable from current_cell using BFS
-        reachable_cells = set()
+        risk_lambda = float(self._get_cfg("graph_target_risk_lambda", 0.5))
+        dist = None
+        prev = None
         if current_cell is not None:
-            from collections import deque
-            queue = deque([current_cell])
-            visited = {current_cell.index}
-            
-            while queue:
-                cell = queue.popleft()
-                reachable_cells.add(cell.index)
-                for neighbor in cell.neighbors:
-                    if neighbor.index not in visited and not neighbor.is_blocked:
-                        visited.add(neighbor.index)
-                        queue.append(neighbor)
-        
-        # Find best cell (ghost OR real) among REACHABLE cells based on propagated_value
+            dist, prev = self._run_dijkstra(current_cell.index)
+            self._dijkstra_cache = (current_cell.index, dist, prev)
+
+        # Find best cell (ghost OR real) among reachable cells based on score
         for cell in self.cells.values():
             if cell.is_blocked:
-                continue
-            
-            # Skip if cell is not reachable from current position
-            if current_cell is not None and cell.index not in reachable_cells:
                 continue
             
             # Skip current cell itself
             if current_cell is not None and cell.index == current_cell.index:
                 continue
+
+            if current_cell is not None:
+                if dist is None:
+                    continue
+                cost = dist.get(cell.index)
+                if cost is None:
+                    continue
+                score = cell.propagated_value - risk_lambda * cost
+            else:
+                score = cell.propagated_value
                 
-            # Select cell with highest propagated value (uncertainty flow)
-            if cell.propagated_value > best_value:
-                best_value = cell.propagated_value
+            # Select cell with highest score
+            if score > best_score:
+                best_score = score
                 best_cell = cell
         
         if best_cell is None and current_cell is not None:
-            print(f"[HIGH-LEVEL] No reachable target cells! Reachable: {len(reachable_cells)} cells")
+            reachable_count = len(dist) if dist is not None else 0
+            print(f"[HIGH-LEVEL] No reachable target cells! Reachable: {reachable_count} cells")
         elif best_cell is not None:
             cell_type = "Ghost" if best_cell.is_ghost else "Real"
-            print(f"[HIGH-LEVEL] Selected {cell_type} cell {best_cell.index} with value {best_value:.4f}")
+            cost_str = ""
+            if dist is not None and best_cell.index in dist:
+                cost_str = f", cost={dist[best_cell.index]:.3f}"
+            print(
+                f"[HIGH-LEVEL] Selected {cell_type} cell {best_cell.index} "
+                f"score={best_score:.4f}{cost_str}"
+            )
         
         return best_cell
 
-    def find_path_to_target(self, start_cell, target_cell):
-        """
-        Find path from start_cell to target_cell using Dijkstra (risk cost).
-        
-        Returns:
-            path: list of CellNodes from start to target (inclusive)
-                  or None if no path found
-        """
-        if start_cell is None or target_cell is None:
-            print(f"  [PATH] Cannot find path: start={start_cell}, target={target_cell}")
-            return None
-        
-        if start_cell.index == target_cell.index:
-            return [start_cell]
-        
+    def _run_dijkstra(self, start_idx):
         import heapq
 
-        dist = {start_cell.index: 0.0}
+        dist = {start_idx: 0.0}
         prev = {}
-        heap = [(0.0, start_cell.index)]
+        heap = [(0.0, start_idx)]
         visited = set()
 
         while heap:
@@ -1294,9 +1287,6 @@ class CellManager:
             if curr_idx in visited:
                 continue
             visited.add(curr_idx)
-
-            if curr_idx == target_cell.index:
-                break
 
             curr_node = self.cells.get(curr_idx)
             if curr_node is None:
@@ -1313,11 +1303,50 @@ class CellManager:
                     prev[neighbor.index] = curr_idx
                     heapq.heappush(heap, (new_cost, neighbor.index))
 
+        return dist, prev
+
+    def find_path_to_target(self, start_cell, target_cell):
+        """
+        Find path from start_cell to target_cell using Dijkstra (risk cost).
+        
+        Returns:
+            path: list of CellNodes from start to target (inclusive)
+                  or None if no path found
+        """
+        if start_cell is None or target_cell is None:
+            print(f"  [PATH] Cannot find path: start={start_cell}, target={target_cell}")
+            return None
+
+        cached = self._dijkstra_cache
+        if cached is not None:
+            cache_start, dist, prev = cached
+            if cache_start == start_cell.index and target_cell.index in dist:
+                path_indices = [target_cell.index]
+                while path_indices[-1] != start_cell.index:
+                    next_idx = prev.get(path_indices[-1])
+                    if next_idx is None:
+                        break
+                    path_indices.append(next_idx)
+                if path_indices[-1] == start_cell.index:
+                    path_indices.reverse()
+                    path = [self.cells[idx] for idx in path_indices]
+                    path_str = " → ".join([f"{c.index}" for c in path])
+                    print(
+                        f"  [PATH] Found (cached): {path_str} "
+                        f"({len(path)} cells, cost={dist[target_cell.index]:.3f})"
+                    )
+                    return path
+        
+        if start_cell.index == target_cell.index:
+            return [start_cell]
+        
+        dist, prev = self._run_dijkstra(start_cell.index)
+
         if target_cell.index not in dist:
             print(f"  [PATH] NO PATH from {start_cell.index} to {target_cell.index}!")
             print(f"         Start neighbors: {[n.index for n in start_cell.neighbors]}")
             print(f"         Target neighbors: {[n.index for n in target_cell.neighbors]}")
-            print(f"         Visited {len(visited)} cells, target not reachable")
+            print(f"         Visited {len(dist)} cells, target not reachable")
             return None
 
         path_indices = [target_cell.index]

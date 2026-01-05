@@ -228,6 +228,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
             "graph_diffuse_gamma": nbh_cfg.get("graph_diffuse_gamma", 0.95),
             "graph_diffuse_iterations": nbh_cfg.get("graph_diffuse_iterations", 50),
             "graph_diffuse_on_update": nbh_cfg.get("graph_diffuse_on_update", False),
+            "graph_target_risk_lambda": nbh_cfg.get("graph_target_risk_lambda", 0.5),
         }
 
         connectivity_cfg = {
