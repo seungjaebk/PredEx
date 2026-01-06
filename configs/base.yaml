@@ -37,7 +37,7 @@ cell_size: 25
 
 nbh:
   # Ghost creation / promotion
-  graph_max_ghost_distance: 2
+  graph_max_ghost_distance: 100
   graph_obs_blocked_ratio: 0.3
   graph_unknown_ratio_threshold: 0.5
   graph_centroid_blocked_threshold: 0.8
@@ -61,7 +61,7 @@ nbh:
   # - full: full graph update every step (structure + risk + cache + current cell)
   # - target_change: light update every step; full update only when reselecting target
   # - light_only: one-time full init; then light updates only (fastest, staler graph)
-  graph_update_mode: target_change
+  graph_update_mode: full
 
   # Diffusion
   graph_diffuse_gamma: 0.95
@@ -69,17 +69,17 @@ nbh:
   graph_diffuse_on_update: false
 
   # Debug
-  graph_debug_edges: false
-  graph_debug_edge_samples:
+  graph_debug_edges: false              # log per-edge connectivity checks (portal/LOS/mini-A*)
+  graph_debug_edge_samples:             # edge pairs to visualize LOS sampling when graph_debug_los_viz is on
     # - [[-8, 11], [-9, 11]]
     # - [[-1, 12], [-2, 12]]
     # - [[-1, 13], [-2, 13]]
-  graph_debug_targets: true
-  graph_debug_belief: false
-  graph_debug_risk_stats: true
-  graph_debug_propagation_stats: false
-  graph_debug_local_astar: false
-  graph_debug_los_viz: true
+  graph_debug_targets: true             # log target selection/reselection reasons
+  graph_debug_belief: false             # reserved (no current output)
+  graph_debug_risk_stats: true          # log graph stats, p_occ, edge cost, edge strip maxima
+  graph_debug_propagation_stats: false  # log diffusion value stats
+  graph_debug_local_astar: false        # log local A* inputs and line cost samples
+  graph_debug_los_viz: true             # save LOS debug plots for edges in graph_debug_edge_samples
 
   # Visualization
   viz_save_every_steps: 10
