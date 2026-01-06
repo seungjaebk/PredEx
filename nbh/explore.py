@@ -66,7 +66,7 @@ from nbh.frontier_utils import (
     determine_local_planner
 )
 from nbh.exploration_config import get_options_dict_from_yml
-from nbh.viz_utils import should_save_graph_map, should_save_viz
+from nbh.viz_utils import compute_pad_offsets, should_save_graph_map, should_save_viz
 
 # ==============================================================================
 # Utility imports
@@ -376,20 +376,9 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         pd_size = 500 #padding_size; padded pixels for raycast at the boundary of map
         #there is a small offset between observed map size and lama prediction output size
         gt_h, gt_w = mapper.gt_map.shape[0],mapper.gt_map.shape[1]
-        pad_h = gt_h%16
-        pad_w = gt_w%16
-        if pad_h == 0:
-            pad_h1 = 0
-            pad_h2 = 0
-        else:
-            pad_h1 = int((16-pad_h)/2)
-            pad_h2 = 16-pad_h - pad_h1
-        if pad_w == 0:
-            pad_w1 = 0
-            pad_w2 = 0
-        else:
-            pad_w1 = int((16-pad_w)/2)
-            pad_w2 = 16-pad_w - pad_w1
+        pad_h1, pad_h2, pad_w1, pad_w2 = compute_pad_offsets(gt_h, gt_w, divisor=16)
+        obs_offset_r = pd_size - pad_h1
+        obs_offset_c = pd_size - pad_w1
 
         # initial saves (gt_map, pose_list)
         cv2.imwrite(gt_map_save_path, smu.convert_01_single_channel_to_0_255_3_channel(mapper.gt_map))
@@ -1206,16 +1195,17 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     #colors_ = ["#68e371", "#D9D9D9", "#f0432b"]
                     colors_ = ["#FFFFFF", "#D9D9D9", "#000000"]
                     cmap = ListedColormap(colors_)
-                    ax_obs.imshow(mapper.obs_map[pd_size:-pd_size,pd_size:-pd_size], cmap = cmap)#, **map_kwargs)
+                    obs_viz_map = latest_padded_obs_map if latest_padded_obs_map is not None else mapper.obs_map
+                    ax_obs.imshow(obs_viz_map[pd_size:-pd_size,pd_size:-pd_size], cmap = cmap)#, **map_kwargs)
 
                     
 
                     if pose_list is not None:
-                        ax_obs.plot(pose_list[:, 1]-pd_size, pose_list[:, 0]-pd_size, c='#eb4205', alpha=1.0)
+                        ax_obs.plot(pose_list[:, 1]-obs_offset_c, pose_list[:, 0]-obs_offset_r, c='#eb4205', alpha=1.0)
                     if mode not in ['upen', 'hector', 'hectoraug'] and locked_frontier_center is not None: # UPEN and Hector do not have locked frontiers
-                        ax_obs.scatter(locked_frontier_center[1]-pd_size, locked_frontier_center[0]-pd_size, c='#eb4205', s=10)
+                        ax_obs.scatter(locked_frontier_center[1]-obs_offset_c, locked_frontier_center[0]-obs_offset_r, c='#eb4205', s=10)
                     if mode not in ['hector', 'hectoraug']: # Hector does not have path planning
-                        ax_obs.plot(plan_y-pd_size, plan_x-pd_size,c='#eb4205', linestyle=':')
+                        ax_obs.plot(plan_y-obs_offset_c, plan_x-obs_offset_r,c='#eb4205', linestyle=':')
 
                     if mode not in ['upen', 'hector', 'hectoraug']: # UPEN and Hector are not a frontier planner
                         if viz_medium_flooded_grid is not None:
@@ -1239,7 +1229,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             # Target Cell Center (Blue Circle)
                             tc_r, tc_c = target_cell.center
                             ax_gt.scatter(tc_c - pd_size, tc_r - pd_size, c='blue', s=30, marker='o', label='Cell Center')
-                            ax_obs.scatter(tc_c - pd_size, tc_r - pd_size, c='blue', s=30, marker='o')
+                            ax_obs.scatter(tc_c - obs_offset_c, tc_r - obs_offset_r, c='blue', s=30, marker='o')
 
                     # Visualize Flow Vector
                     if mode == 'nbh' and 'delta_pixels' in locals():
@@ -1270,10 +1260,10 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             occ_rows, occ_cols = np.where(occluded_mask)
                             
                             # Plot Visible within range (Cyan)
-                            ax_obs.scatter(vis_cols - pd_size, vis_rows - pd_size, c='cyan', s=1, alpha=0.05, label='Visible Area')
+                            ax_obs.scatter(vis_cols - obs_offset_c, vis_rows - obs_offset_r, c='cyan', s=1, alpha=0.05, label='Visible Area')
                             
                             # Plot Occluded (Orange) - within range but blocked
-                            ax_obs.scatter(occ_cols - pd_size, occ_rows - pd_size, c='orange', s=1, alpha=0.05, label='Occluded Area')
+                            ax_obs.scatter(occ_cols - obs_offset_c, occ_rows - obs_offset_r, c='orange', s=1, alpha=0.05, label='Occluded Area')
                             
                         except Exception:
                             pass
@@ -1285,20 +1275,20 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             # 1. Plot Raw Flow (Cyan) - Where the brain wants to go
                             if 'delta_norm' in locals():
                                 d_raw = delta_norm * 3.0 # Scale to match step size
-                                ax_obs.arrow(cur_pose[1]-pd_size, cur_pose[0]-pd_size, 
+                                ax_obs.arrow(cur_pose[1]-obs_offset_c, cur_pose[0]-obs_offset_r, 
                                              d_raw[1]*viz_scale, d_raw[0]*viz_scale, 
                                              color='cyan', head_width=3, label='Flow Vec')
 
                             # 2. Plot Repulsion (Yellow) - Where walls push
                             if 'repulsive_force' in locals() and np.linalg.norm(repulsive_force) > 0.1:
                                 d_rep = repulsive_force * 3.0
-                                ax_obs.arrow(cur_pose[1]-pd_size, cur_pose[0]-pd_size, 
+                                ax_obs.arrow(cur_pose[1]-obs_offset_c, cur_pose[0]-obs_offset_r, 
                                              d_rep[1]*viz_scale, d_rep[0]*viz_scale, 
                                              color='yellow', head_width=3, label='Repulsion')
 
                             # 3. Plot Final Result (Red/Orange) - Actual movement
                             d_row, d_col = delta_pixels[0] * viz_scale, delta_pixels[1] * viz_scale
-                            ax_obs.arrow(cur_pose[1]-pd_size, cur_pose[0]-pd_size, d_col, d_row, color='red', head_width=5, label='Combined Vel')
+                            ax_obs.arrow(cur_pose[1]-obs_offset_c, cur_pose[0]-obs_offset_r, d_col, d_row, color='red', head_width=5, label='Combined Vel')
                             
                             # Add Legend (Flow mode)
                             from matplotlib.lines import Line2D
