@@ -426,7 +426,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         # Gateway Locking & Waypoint Logic
         current_waypoint = None
         locked_target_cell = None  # Store the cell object for visualization
-        locked_path_to_target = None  # Store BFS path for graph-based distance
+        locked_path_to_target = None  # Store risk path for graph-based distance
         locked_trajectory = None  # Store the selected flow trajectory (computed once per cell)
         locked_trajectory_samples = None  # Store all sampled trajectories for visualization
         WAYPOINT_REACHED_TOLERANCE = 1.0 # Pixels - must reach very close to exact center
@@ -803,7 +803,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                     print("[HIGH-LEVEL] No exploration target found!")
                                 path_to_target = None
                         
-                        # --- STEP 3: Get next cell from BFS path (primary) or greedy fallback ---
+                        # --- STEP 3: Get next cell from risk path (primary) or greedy fallback ---
                         next_cell = None
                         decision_type = "NO_PATH"
                         if path_to_target is not None and cell_manager.current_cell is not None:

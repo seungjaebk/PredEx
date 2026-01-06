@@ -118,18 +118,18 @@ def plan_next_waypoint(
     """
     Get the next cell to navigate to.
     
-    Tries BFS path first, falls back to greedy neighbor selection.
+    Tries risk path first, falls back to greedy neighbor selection.
     
     Args:
         cell_manager: CellManager instance
-        path_to_target: BFS-computed path to target
+        path_to_target: Dijkstra-computed risk path to target
         obs_map: Observation map for collision checking
         
     Returns:
         next_cell: CellNode to navigate to
         decision_type: Description of how cell was chosen
     """
-    # First try: Follow BFS path
+    # First try: Follow risk path
     next_cell, decision_type = cell_manager.get_next_path_cell(path_to_target)
     
     # Fallback: Greedy neighbor selection
@@ -158,7 +158,7 @@ def lock_new_waypoint(
         waypoint_state: WaypointState to update
         next_cell: CellNode for immediate navigation
         target_cell: High-level target cell
-        path_to_target: Full BFS path
+        path_to_target: Full risk path
         cur_pose: Current robot position
         trajectory: Selected flow trajectory
         trajectory_samples: All sampled trajectories (for visualization)

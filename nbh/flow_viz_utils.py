@@ -26,6 +26,9 @@ def normalize_edge_risks(costs):
         return np.zeros_like(costs, dtype=float)
     return np.clip((costs - min_val) / (max_val - min_val), 0.0, 1.0)
 
+def get_graph_path_label():
+    return "Risk Path"
+
 
 def sample_multiple_trajectories(flow_model, flow_input_tensor, flow_goal_tensor, 
                                   flow_device, num_samples=100, num_steps=10,
@@ -530,7 +533,7 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
         path_centers = np.array([c.center - pd_size for c in path_to_target])
         ax.plot(path_centers[:, 1], path_centers[:, 0], 
                color='#FF00FF', linestyle='--', linewidth=2.5, 
-               alpha=0.9, label='BFS Path', zorder=8)
+               alpha=0.9, label=get_graph_path_label(), zorder=8)
     
     # Highlight A* local path (red solid line)
     if astar_path is not None and len(astar_path) > 1:

@@ -1456,7 +1456,7 @@ class CellManager:
     
     def get_next_path_cell(self, path_to_target):
         """
-        Get the next cell from the BFS-computed path.
+        Get the next cell from the risk path.
         
         This ensures the robot follows the planned path to target,
         rather than relying on greedy neighbor selection.
