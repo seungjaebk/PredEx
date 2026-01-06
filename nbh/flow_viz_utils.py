@@ -16,6 +16,17 @@ import torch
 # 1. TRAJECTORY DISTRIBUTION VISUALIZATION
 # ============================================================================
 
+def normalize_edge_risks(costs):
+    costs = np.asarray(costs, dtype=float)
+    if costs.size == 0:
+        return costs
+    min_val = float(np.min(costs))
+    max_val = float(np.max(costs))
+    if max_val <= min_val:
+        return np.zeros_like(costs, dtype=float)
+    return np.clip((costs - min_val) / (max_val - min_val), 0.0, 1.0)
+
+
 def sample_multiple_trajectories(flow_model, flow_input_tensor, flow_goal_tensor, 
                                   flow_device, num_samples=100, num_steps=10,
                                   trajectory_len=20, delta_scale=20.0,
@@ -416,7 +427,10 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
     # Draw edges first (so nodes appear on top)
     if show_edges:
         real_edge_lines = []
+        real_edge_costs = []
         ghost_edge_lines = []
+        ghost_edge_costs = []
+        cmap = plt.get_cmap("magma")
         
         for idx, cell in cell_manager.cells.items():
             if cell.is_blocked:
@@ -433,19 +447,33 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
                 # Draw edge (use (col, row) for matplotlib)
                 edge = [center[::-1], n_center[::-1]]
                 
-                # Different colors for real-real vs real-ghost edges
+                edge_key = tuple(sorted([cell.index, neighbor.index]))
+                edge_cost = cell_manager.edge_costs.get(edge_key, 0.0)
                 if cell.is_ghost or neighbor.is_ghost:
                     ghost_edge_lines.append(edge)
+                    ghost_edge_costs.append(edge_cost)
                 else:
                     real_edge_lines.append(edge)
+                    real_edge_costs.append(edge_cost)
         
         if real_edge_lines:
-            lc = LineCollection(real_edge_lines, colors='blue', alpha=0.5, linewidths=1.0)
+            norm_vals = normalize_edge_risks(np.array(real_edge_costs, dtype=float))
+            lc = LineCollection(
+                real_edge_lines,
+                colors=cmap(norm_vals),
+                alpha=0.7,
+                linewidths=1.1,
+            )
             ax.add_collection(lc)
         if ghost_edge_lines:
-            # Ghost edges as dashed lines (uncertain/speculative connections)
-            lc = LineCollection(ghost_edge_lines, colors='orange', alpha=0.5, 
-                               linewidths=1.0, linestyles='dashed')
+            norm_vals = normalize_edge_risks(np.array(ghost_edge_costs, dtype=float))
+            lc = LineCollection(
+                ghost_edge_lines,
+                colors=cmap(norm_vals),
+                alpha=0.6,
+                linewidths=1.0,
+                linestyles='dashed',
+            )
             ax.add_collection(lc)
     
     # Draw nodes (smaller icons)
