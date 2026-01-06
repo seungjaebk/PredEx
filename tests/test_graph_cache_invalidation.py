@@ -22,10 +22,10 @@ def _make_manager(connectivity_cfg=None):
 
 def _build_maps():
     obs = np.full((8, 8), 0.5, dtype=np.float32)
-    obs[0:4, 0:4] = 0.0
+    obs[0:4, 0:8] = 0.0
     pred_mean = np.full_like(obs, 0.2)
     pred_var = np.full_like(obs, 0.1)
-    inflated = np.where(obs >= 0.8, np.inf, 1.0)
+    inflated = np.full_like(obs, np.inf)
     return obs, pred_mean, pred_var, inflated
 
 
@@ -68,8 +68,8 @@ def test_cache_invalidates_on_obs_change():
     old_keys = set(getattr(manager, "_mini_astar_cache", {}).keys())
 
     obs2 = obs.copy()
-    obs2[:, 4] = 1.0
-    inflated2 = np.where(obs2 >= 0.8, np.inf, 1.0)
+    obs2[7, 7] = 1.0
+    inflated2 = np.full_like(obs2, np.inf)
 
     manager.update_graph(np.array([2, 2]), obs2, pred_mean, pred_var, inflated2)
     manager.update_graph(np.array([2, 2]), obs2, pred_mean, pred_var, inflated2)

@@ -11,7 +11,7 @@ def test_edge_strip_stats_pred_and_pocc_max():
     p_occ = np.zeros((30, 30), dtype=np.float32)
 
     pred[5:15, 10:15] = 0.9
-    p_occ[5:15, 15:20] = 0.7
+    p_occ[5:15, 5:10] = 0.7
 
     cm.edge_costs = {((0, 0), (0, 1)): 0.1}
     stats = cm._edge_strip_stats(pred, p_occ)

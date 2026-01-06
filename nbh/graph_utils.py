@@ -555,7 +555,7 @@ class CellManager:
             print(
                 "[GRAPH][STATS] "
                 f"potential={potential_count} processed={processed_count} skipped_outside={skipped_outside} "
-                f"max_ghost_distance={max_ghost_distance}"
+                f"grid_policy={grid_policy} max_ghost_distance={max_ghost_distance}"
             )
             print(
                 "[GRAPH][EDGES] "
@@ -782,7 +782,11 @@ class CellManager:
                 "ttl_left": ttl_left,
             }
 
-        if not portal_ok and self._should_fallback_when_portal_false(obs_map, node_idx, neighbor_idx):
+        if (
+            not portal_ok
+            and los_ok
+            and self._should_fallback_when_portal_false(obs_map, node_idx, neighbor_idx)
+        ):
             ok, path_len, reason, cache_status, ttl_left, path_samples = self._run_mini_astar_local_rr(
                 node_idx, neighbor_idx, obs_map
             )
@@ -1305,6 +1309,8 @@ class CellManager:
         if obs_change > change_threshold:
             self._obs_update_id += 1
             self._mini_astar_cache.clear()
+            if change_threshold <= 0.0:
+                self._rr_edge_cache.clear()
         self._last_obs_map = obs_map.copy()
 
         if pred_mean_map is not None:

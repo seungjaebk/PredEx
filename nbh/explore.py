@@ -379,6 +379,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         pad_h1, pad_h2, pad_w1, pad_w2 = compute_pad_offsets(gt_h, gt_w, divisor=16)
         obs_offset_r = pd_size - pad_h1
         obs_offset_c = pd_size - pad_w1
+        cell_graph_offset = np.array([pad_h1, pad_w1], dtype=float)
 
         # initial saves (gt_map, pose_list)
         cv2.imwrite(gt_map_save_path, smu.convert_01_single_channel_to_0_255_3_channel(mapper.gt_map))
@@ -1402,11 +1403,17 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     # --- NEW: Cell Graph Visualization ---
                     if mode == 'nbh' and 'ax_cell_graph' in dir() and cell_manager is not None:
                         ax_cell_graph.clear()
+                        cell_graph_obs_map = (
+                            latest_padded_obs_map
+                            if latest_padded_obs_map is not None
+                            else get_padded_obs_map(mapper.obs_map)
+                        )
                         visualize_cell_graph(
-                            ax_cell_graph, cell_manager, padded_obs_map, mean_map,
+                            ax_cell_graph, cell_manager, cell_graph_obs_map, mean_map,
                             current_pose=cur_pose, target_cell=target_cell, 
-                            path_to_target=path_to_target, pd_size=pd_size,
-                            show_cell_boundaries=True
+                            path_to_target=path_to_target, pd_size=0,
+                            show_cell_boundaries=True,
+                            display_offset=cell_graph_offset,
                         )
 
                     plt.tight_layout()
@@ -1425,19 +1432,29 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     # Save detailed graph visualization with scores (baseline-style)
                     if mode == 'nbh' and cell_manager is not None and show_plt and save_graph_map and should_save_fig:
                         fig_graph, ax_graph = plt.subplots(1, 1, figsize=(10, 10))
-                        ax_graph.imshow(1-mapper.gt_map[pd_size:-pd_size,pd_size:-pd_size], cmap='gray', vmin=0, vmax=1)
+                        graph_gt_map = padded_gt_map if padded_gt_map is not None else get_padded_gt_map(mapper.gt_map)
+                        ax_graph.imshow(1-graph_gt_map, cmap='gray', vmin=0, vmax=1)
                         visualize_cell_graph(
-                            ax_graph, cell_manager, padded_gt_map, mean_map,
+                            ax_graph, cell_manager, graph_gt_map, mean_map,
                             current_pose=cur_pose, target_cell=target_cell,
-                            path_to_target=path_to_target, pd_size=pd_size,
+                            path_to_target=path_to_target, pd_size=0,
                             overlay_mode=True,
                             show_scores=True,
                             start_cell=None,
                             astar_path=astar_path if 'astar_path' in locals() else None,
-                            show_cell_boundaries=True
+                            show_cell_boundaries=True,
+                            display_offset=cell_graph_offset,
                         )
-                        ax_graph.scatter(cur_pose[1] - pd_size, cur_pose[0] - pd_size, c='lime', s=30, marker='*',
-                                         zorder=20, edgecolors='black', linewidths=0.5)
+                        ax_graph.scatter(
+                            cur_pose[1] + cell_graph_offset[1],
+                            cur_pose[0] + cell_graph_offset[0],
+                            c='lime',
+                            s=30,
+                            marker='*',
+                            zorder=20,
+                            edgecolors='black',
+                            linewidths=0.5,
+                        )
                         scores = [n.propagated_value for n in cell_manager.cells.values() if n.propagated_value > 0]
                         min_score = min(scores) if scores else 0.0
                         max_score = max(scores) if scores else 0.0

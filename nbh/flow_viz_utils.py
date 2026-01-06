@@ -360,7 +360,7 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
                           current_pose=None, target_cell=None, 
                           path_to_target=None, show_edges=True, pd_size=500,
                           overlay_mode=False, start_cell=None, astar_path=None, show_scores=False,
-                          show_cell_boundaries=False):
+                          show_cell_boundaries=False, display_offset=None):
     """
     Visualize the cell graph with Real (observed) and Ghost (hallucinated) nodes.
     
@@ -379,7 +379,12 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
         astar_path: A* local path to visualize (numpy array of [row, col] coordinates)
         show_scores: whether to show node scores as text labels
         show_cell_boundaries: draw dashed cell boundaries
+        display_offset: (row, col) offset to apply when plotting cell centers
     """
+    if display_offset is None:
+        display_offset = np.array([-pd_size, -pd_size], dtype=float)
+    else:
+        display_offset = np.array(display_offset, dtype=float)
     if not overlay_mode and obs_map is not None:
         # Show map as background (subtract padding for visualization)
         # Invert colormap: 0=free→white, 1=occupied→black
@@ -393,7 +398,7 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
     blocked_nodes = []
     
     for idx, cell in cell_manager.cells.items():
-        center = cell.center - pd_size  # Adjust for padding
+        center = cell.center + display_offset  # Adjust for visualization offset
         if center[0] < 0 or center[1] < 0:
             continue
             
@@ -410,7 +415,7 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
         for _, cell in cell_manager.cells.items():
             if cell.is_blocked:
                 continue
-            center = cell.center - pd_size
+            center = cell.center + display_offset
             if center[0] < 0 or center[1] < 0:
                 continue
             top = float(center[0] - half)
@@ -438,13 +443,13 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
         for idx, cell in cell_manager.cells.items():
             if cell.is_blocked:
                 continue
-            center = cell.center - pd_size
+            center = cell.center + display_offset
             if center[0] < 0 or center[1] < 0:
                 continue
             for neighbor in cell.neighbors:
                 if neighbor.is_blocked:
                     continue
-                n_center = neighbor.center - pd_size
+                n_center = neighbor.center + display_offset
                 if n_center[0] < 0 or n_center[1] < 0:
                     continue
                 # Draw edge (use (col, row) for matplotlib)
@@ -509,20 +514,20 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
         cur_cell_idx = cell_manager.get_cell_index(current_pose)
         cur_cell = cell_manager.get_cell(cur_cell_idx)
         if cur_cell is not None:
-            center = cur_cell.center - pd_size
+            center = cur_cell.center + display_offset
             ax.scatter([center[1]], [center[0]], c='red', s=80, marker='D',
                        zorder=10, label='Current Cell', edgecolors='black', linewidths=0.5)
     
     # Highlight target cell (diamond shape, transparent inner, lime border)
     if target_cell is not None:
-        center = target_cell.center - pd_size
+        center = target_cell.center + display_offset
         ax.scatter([center[1]], [center[0]], marker='D', s=120,
                    facecolors='none', edgecolors='lime', linewidths=2.0,
                    zorder=10, label='Target Cell')
     
     # Highlight start cell (red diamond, same size as target)
     if start_cell is not None:
-        center = start_cell.center - pd_size
+        center = start_cell.center + display_offset
         ax.scatter([center[1]], [center[0]], marker='D', s=120,
                    facecolors='none', edgecolors='red', linewidths=2.0,
                    zorder=10, label='Start Cell')
@@ -530,7 +535,7 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
     # Highlight path from current cell to target (magenta dashed line)
     if path_to_target is not None and len(path_to_target) > 1:
         # Draw thick magenta dashed path line connecting cell centers
-        path_centers = np.array([c.center - pd_size for c in path_to_target])
+        path_centers = np.array([c.center + display_offset for c in path_to_target])
         ax.plot(path_centers[:, 1], path_centers[:, 0], 
                color='#FF00FF', linestyle='--', linewidth=2.5, 
                alpha=0.9, label=get_graph_path_label(), zorder=8)
@@ -538,14 +543,14 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
     # Highlight A* local path (red solid line)
     if astar_path is not None and len(astar_path) > 1:
         # A* path is in (row, col) format, convert to display coordinates
-        astar_display = astar_path - pd_size
+        astar_display = astar_path + display_offset
         ax.plot(astar_display[:, 1], astar_display[:, 0],
                'r-', linewidth=2.0, alpha=0.8, label='A* Path', zorder=9)
     
     # Show node scores as text labels (for debugging)
     if show_scores:
         for idx, cell in cell_manager.cells.items():
-            center = cell.center - pd_size
+            center = cell.center + display_offset
             if center[0] < 0 or center[1] < 0:
                 continue
             # Use propagated_value as the score (final value after diffusion)
