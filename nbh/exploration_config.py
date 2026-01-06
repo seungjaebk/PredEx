@@ -55,6 +55,22 @@ def _get_cfg_value(cfg, key, default):
     return getattr(cfg, key, default)
 
 
+def build_promotion_cfg(nbh_cfg):
+    return {
+        "graph_grid_policy": _get_cfg_value(nbh_cfg, "graph_grid_policy", "full_map"),
+        "graph_max_ghost_distance": _get_cfg_value(nbh_cfg, "graph_max_ghost_distance", 2),
+        "graph_obs_blocked_ratio": _get_cfg_value(nbh_cfg, "graph_obs_blocked_ratio", 0.3),
+        "graph_unknown_ratio_threshold": _get_cfg_value(nbh_cfg, "graph_unknown_ratio_threshold", 0.5),
+        "graph_centroid_blocked_threshold": _get_cfg_value(nbh_cfg, "graph_centroid_blocked_threshold", 0.8),
+        "graph_ghost_pred_mean_free_threshold": _get_cfg_value(nbh_cfg, "graph_ghost_pred_mean_free_threshold", 0.4),
+        "graph_ghost_pred_var_max_threshold": _get_cfg_value(nbh_cfg, "graph_ghost_pred_var_max_threshold", 0.3),
+        "graph_diffuse_gamma": _get_cfg_value(nbh_cfg, "graph_diffuse_gamma", 0.95),
+        "graph_diffuse_iterations": _get_cfg_value(nbh_cfg, "graph_diffuse_iterations", 50),
+        "graph_diffuse_on_update": _get_cfg_value(nbh_cfg, "graph_diffuse_on_update", False),
+        "graph_target_risk_lambda": _get_cfg_value(nbh_cfg, "graph_target_risk_lambda", 0.5),
+    }
+
+
 def get_graph_update_mode(nbh_cfg):
     mode = _get_cfg_value(nbh_cfg, "graph_update_mode", GRAPH_UPDATE_MODE_DEFAULT)
     if mode is None:

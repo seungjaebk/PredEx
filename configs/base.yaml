@@ -37,6 +37,7 @@ cell_size: 25
 
 nbh:
   # Ghost creation / promotion
+  graph_grid_policy: full_map          # full_map or frontier_expand
   graph_max_ghost_distance: 100
   graph_obs_blocked_ratio: 0.3
   graph_unknown_ratio_threshold: 0.5

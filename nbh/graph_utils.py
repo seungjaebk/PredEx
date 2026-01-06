@@ -88,6 +88,7 @@ class CellManager:
         self._last_pred_map = None
         self._last_inflated_sig = None
         self.edge_costs = {}
+        self.last_graph_stats = None
         self._p_occ_map = None
         self._dijkstra_cache = None  # (start_idx, dist, prev)
         self.debug_edge_samples = set()
@@ -307,6 +308,7 @@ class CellManager:
         map_h, map_w = obs_map.shape
         self.free_mask = free_mask
         max_ghost_distance = self._get_cfg("graph_max_ghost_distance", max_ghost_distance)
+        grid_policy = self._get_cfg("graph_grid_policy", "frontier_expand")
         obs_blocked_ratio = self._get_cfg("graph_obs_blocked_ratio", 0.3)
         unknown_ratio_threshold = self._get_cfg("graph_unknown_ratio_threshold", 0.5)
         centroid_blocked_threshold = self._get_cfg("graph_centroid_blocked_threshold", 0.8)
@@ -321,34 +323,45 @@ class CellManager:
         skipped_outside = 0
         
         # --- 1. UPDATE REAL NODES (Observed) ---
-        # Expand from existing cells + their neighbors
-        
-        active_indices = list(self.cells.keys())
-        
-        # Get indices of REAL (observed) cells only
-        real_cell_indices = set()
-        for idx, cell in self.cells.items():
-            if not cell.is_ghost and not cell.is_blocked:
-                real_cell_indices.add(idx)
-        
-        # Expand only from REAL cells (not ghosts!) with distance limit
-        # No bounds checking on indices - they can be negative!
-        potential_indices = set(active_indices)
-        frontier = list(real_cell_indices)
-        distances = {idx: 0 for idx in real_cell_indices}
-        
-        for distance in range(1, max_ghost_distance + 1):
-            new_frontier = []
-            for idx in frontier:
-                r, c = idx
-                for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
-                    nr, nc = r+dr, c+dc
-                    # No bounds check on cell indices! But we check pixel bounds when accessing map
-                    if (nr, nc) not in distances:
-                        distances[(nr, nc)] = distance
-                        potential_indices.add((nr, nc))
-                        new_frontier.append((nr, nc))
-            frontier = new_frontier
+        potential_indices = set()
+        distances = {}
+        rows = int(np.ceil(map_h / self.cell_size))
+        cols = int(np.ceil(map_w / self.cell_size))
+
+        if grid_policy == "full_map":
+            for r in range(rows):
+                for c in range(cols):
+                    potential_indices.add((r, c))
+        else:
+            # Expand from existing cells + their neighbors
+            active_indices = list(self.cells.keys())
+
+            # Get indices of REAL (observed) cells only
+            real_cell_indices = set()
+            for idx, cell in self.cells.items():
+                if not cell.is_ghost and not cell.is_blocked:
+                    real_cell_indices.add(idx)
+
+            # Expand only from REAL cells (not ghosts!) with distance limit
+            # No bounds checking on indices - they can be negative!
+            potential_indices = set(active_indices)
+            frontier = list(real_cell_indices)
+            distances = {idx: 0 for idx in real_cell_indices}
+
+            for distance in range(1, max_ghost_distance + 1):
+                new_frontier = []
+                for idx in frontier:
+                    r, c = idx
+                    for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
+                        nr, nc = r+dr, c+dc
+                        if nr < 0 or nc < 0 or nr >= rows or nc >= cols:
+                            continue
+                        # Clamp to map bounds; pixel bounds are still checked when accessing map.
+                        if (nr, nc) not in distances:
+                            distances[(nr, nc)] = distance
+                            potential_indices.add((nr, nc))
+                            new_frontier.append((nr, nc))
+                frontier = new_frontier
         
         for idx in potential_indices:
             potential_count += 1
@@ -452,13 +465,23 @@ class CellManager:
                 # 1. Variance is below threshold (model is confident it's free)
                 # 2. Distance from real cell is reasonable (still need some limit)
                 ghost_distance = distances.get(idx, float('inf'))
-                if cell_variance < pred_var_max_threshold and ghost_distance <= max_ghost_distance:
+                if cell_variance < pred_var_max_threshold and (
+                    grid_policy == "full_map" or ghost_distance <= max_ghost_distance
+                ):
                     node = self.get_cell(idx, is_ghost=True)
                     node.is_blocked = False
                     node.base_value = cell_variance  # Store actual variance
             else:
                 # Unknown and Predicted Blocked/Unknown -> Don't add to graph (Wall in Fog)
                 pass
+
+        self.last_graph_stats = {
+            "potential": potential_count,
+            "processed": processed_count,
+            "skipped_outside": skipped_outside,
+            "max_ghost_distance": max_ghost_distance,
+            "grid_policy": grid_policy,
+        }
 
         # --- 2. CONNECT NEIGHBORS (with wall checking!) ---
         edge_stats = {
