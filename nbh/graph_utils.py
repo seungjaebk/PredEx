@@ -568,6 +568,25 @@ class CellManager:
                     f"min={float(np.min(edge_vals)):.6f} mean={float(np.mean(edge_vals)):.6f} "
                     f"max={float(np.max(edge_vals)):.6f} zero_ratio={zero_ratio:.3f}"
                 )
+                stats = self._edge_strip_stats(pred_mean_map, self._p_occ_map)
+                pred_vals = stats["pred_max"]
+                if pred_vals.size:
+                    hard_thr = float(
+                        self.connectivity_cfg.get("graph_pred_hard_wall_threshold", 0.95)
+                    )
+                    hard_ratio = float(np.mean(pred_vals >= hard_thr))
+                    print(
+                        "[GRAPH][EDGE_PRED_MAX] "
+                        f"min={float(np.min(pred_vals)):.3f} mean={float(np.mean(pred_vals)):.3f} "
+                        f"max={float(np.max(pred_vals)):.3f} hard_ratio={hard_ratio:.3f}"
+                    )
+                pocc_vals = stats["pocc_max"]
+                if pocc_vals.size:
+                    print(
+                        "[GRAPH][EDGE_POCC_MAX] "
+                        f"min={float(np.min(pocc_vals)):.3f} mean={float(np.mean(pocc_vals)):.3f} "
+                        f"max={float(np.max(pocc_vals)):.3f}"
+                    )
     
     def _build_cost_grid(self, obs_map, pred_mean_map=None, edge_type="RR"):
         unknown_as_occ = self.connectivity_cfg.get("graph_unknown_as_occ", True)
@@ -1101,6 +1120,47 @@ class CellManager:
         if max_val is None:
             return False
         return bool(max_val >= threshold)
+
+    def _edge_strip_stats(self, pred_mean_map, p_occ_map):
+        stats = {
+            "pred_max": np.array([], dtype=float),
+            "pocc_max": np.array([], dtype=float),
+        }
+        if not self.edge_costs:
+            return stats
+
+        obs_shape = None
+        if p_occ_map is not None:
+            obs_shape = p_occ_map.shape
+        elif pred_mean_map is not None:
+            obs_shape = pred_mean_map.shape
+        if obs_shape is None:
+            return stats
+
+        if pred_mean_map is not None:
+            pred_mean_map = self._align_pred_map(pred_mean_map, obs_shape, fill_value=1.0)
+        if p_occ_map is not None:
+            p_occ_map = self._align_pred_map(p_occ_map, obs_shape, fill_value=1.0)
+
+        pred_vals = []
+        pocc_vals = []
+        for edge_key in self.edge_costs:
+            node_idx, neighbor_idx = edge_key
+            if pred_mean_map is not None:
+                pred_max = self._edge_strip_max(node_idx, neighbor_idx, pred_mean_map)
+                if pred_max is not None:
+                    pred_vals.append(pred_max)
+            if p_occ_map is not None:
+                pocc_max = self._edge_strip_max(node_idx, neighbor_idx, p_occ_map)
+                if pocc_max is not None:
+                    pocc_vals.append(pocc_max)
+
+        if pred_vals:
+            stats["pred_max"] = np.array(pred_vals, dtype=float)
+        if pocc_vals:
+            stats["pocc_max"] = np.array(pocc_vals, dtype=float)
+
+        return stats
 
     def _align_pred_map(self, pred_map, obs_shape, fill_value=1.0):
         if pred_map is None or obs_shape is None:
