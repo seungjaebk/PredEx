@@ -66,8 +66,7 @@ class CellManager:
         self.connectivity_cfg = connectivity_cfg or {}
         self.debug_cfg = debug_cfg or {}
         
-        # Robot's start position is the centroid of cell (0, 0)
-        # This will be set on first update_graph call if not provided
+        # Origin retained for backward compatibility; absolute indexing is used.
         self.origin = np.array(start_pose, dtype=float) if start_pose is not None else None
         
         self.cells = {}  # Dict: (r, c) -> CellNode, indices can be NEGATIVE!
@@ -260,35 +259,27 @@ class CellManager:
 
     def get_cell_index(self, pixel_pose):
         """
-        Convert pixel (row, col) to cell index (r, c) relative to origin.
-        
-        Cell (0, 0) is centered at self.origin (robot's start position).
-        Indices can be NEGATIVE if robot moves "backwards" from start.
+        Convert pixel (row, col) to absolute cell index (r, c).
+
+        Cell (0, 0) corresponds to the top-left of the map.
         """
-        if self.origin is None:
-            raise ValueError("Origin not set! Call update_graph first or provide start_pose in __init__")
-        
-        offset = np.array(pixel_pose) - self.origin
-        # Add half cell so origin is at CENTER of cell (0, 0), not corner
-        r = int(np.floor((offset[0] + self.cell_size / 2) / self.cell_size))
-        c = int(np.floor((offset[1] + self.cell_size / 2) / self.cell_size))
-        return (r, c)  # Can be negative!
+        r = int(np.floor(pixel_pose[0] / self.cell_size))
+        c = int(np.floor(pixel_pose[1] / self.cell_size))
+        return (r, c)
 
     def get_cell_center(self, cell_idx):
         """
         Get absolute pixel coordinates of cell centroid.
         
         Args:
-            cell_idx: (r, c) tuple, can be negative
+            cell_idx: (r, c) tuple in absolute grid coordinates
             
         Returns:
             np.array([row, col]) in absolute pixel coordinates
         """
-        if self.origin is None:
-            raise ValueError("Origin not set!")
         r, c = cell_idx
-        center_r = self.origin[0] + r * self.cell_size
-        center_c = self.origin[1] + c * self.cell_size
+        center_r = (r + 0.5) * self.cell_size
+        center_c = (c + 0.5) * self.cell_size
         return np.array([center_r, center_c])
 
     def get_cell(self, index, create_if_missing=True, is_ghost=False):
@@ -1250,13 +1241,12 @@ class CellManager:
             for idx, val in updates.items():
                 self.cells[idx].propagated_value = val
         
-        # Note: scent_map_vis is no longer used (indices can be negative now)
+        # Note: scent_map_vis is no longer used (absolute indexing now)
 
     def update_graph_light(self, robot_pose):
         """Update only current cell/visit state without rebuilding the graph."""
         if self.origin is None:
             self.origin = np.array(robot_pose, dtype=float)
-            print(f"[GRAPH] Origin set to robot start: {self.origin}")
         self._mini_astar_step += 1
 
         # Update current position
@@ -1281,10 +1271,9 @@ class CellManager:
 
     def update_graph(self, robot_pose, obs_map, pred_mean_map=None, pred_var_map=None, inflated_occ_grid=None):
         """Main update loop called by agent."""
-        # 0. Set origin on first call (robot's start = cell (0,0) centroid)
+        # Legacy: origin retained for compatibility, not used for indexing.
         if self.origin is None:
             self.origin = np.array(robot_pose, dtype=float)
-            print(f"[GRAPH] Origin set to robot start: {self.origin}")
         self.last_obs_shape = obs_map.shape
         self._mini_astar_step += 1
 
