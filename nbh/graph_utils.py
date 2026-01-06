@@ -80,6 +80,7 @@ class CellManager:
         self.scent_map_vis = None  # Will be created dynamically
 
         self._mini_astar_cache = {}
+        self._rr_edge_cache = {}
         self._mini_astar_step = 0
         self._obs_update_id = 0
         self._pred_update_id = 0
@@ -119,6 +120,7 @@ class CellManager:
         return hash((
             self.connectivity_cfg.get("graph_unknown_as_occ", True),
             self.connectivity_cfg.get("graph_pred_wall_threshold", 0.7),
+            self.connectivity_cfg.get("graph_pred_hard_wall_threshold", 0.95),
             self.connectivity_cfg.get("graph_dilate_diam", 3),
             self._obs_update_id,
             self._pred_update_id,
@@ -162,6 +164,42 @@ class CellManager:
                     blocked = True
 
         return points, (has_sample and not blocked)
+
+    def _samples_blocked(self, samples, obs_map):
+        if not samples:
+            return True
+        h, w = obs_map.shape
+        for r, c in samples:
+            if not (0 <= r < h and 0 <= c < w):
+                return True
+            if obs_map[r, c] >= 0.8:
+                return True
+        return False
+
+    def _get_clear_los_samples(self, node_idx, neighbor_idx, obs_map):
+        centroid1 = self.get_cell_center(node_idx)
+        centroid2 = self.get_cell_center(neighbor_idx)
+
+        points, clear = self._trace_los_line(centroid1, centroid2, obs_map)
+        if clear:
+            return [(r, c) for r, c, _ in points]
+
+        dr = neighbor_idx[0] - node_idx[0]
+        dc = neighbor_idx[1] - node_idx[1]
+        if dr == 0 and dc != 0:
+            offsets = [(-1, 0), (1, 0)]
+        elif dc == 0 and dr != 0:
+            offsets = [(0, -1), (0, 1)]
+        else:
+            return []
+
+        for off_r, off_c in offsets:
+            points, clear = self._trace_los_line(
+                centroid1, centroid2, obs_map, offset_r=off_r, offset_c=off_c
+            )
+            if clear:
+                return [(r, c) for r, c, _ in points]
+        return []
 
     def _save_los_debug_plot(self, node_idx, neighbor_idx, obs_map, line_results):
         if not self.los_viz_dir:
@@ -286,6 +324,10 @@ class CellManager:
 
         self._p_occ_map = self._compute_p_occ(obs_map, pred_mean_map, pred_var_map)
         self.edge_costs = {}
+
+        potential_count = 0
+        processed_count = 0
+        skipped_outside = 0
         
         # --- 1. UPDATE REAL NODES (Observed) ---
         # Expand from existing cells + their neighbors
@@ -318,6 +360,7 @@ class CellManager:
             frontier = new_frontier
         
         for idx in potential_indices:
+            potential_count += 1
             # Get absolute pixel coordinates for this cell
             cell_center = self.get_cell_center(idx)
             half = self.cell_size // 2
@@ -336,7 +379,9 @@ class CellManager:
             
             # Skip if cell is completely outside map
             if y_start_clip >= y_end_clip or x_start_clip >= x_end_clip:
+                skipped_outside += 1
                 continue
+            processed_count += 1
             
             # NOTE: We do NOT use valid_space_map here because it contains GT info!
             # Ghost cells should only be based on obs_map (observed) and pred_mean_map (predicted)
@@ -425,6 +470,12 @@ class CellManager:
                 pass
 
         # --- 2. CONNECT NEIGHBORS (with wall checking!) ---
+        edge_stats = {
+            "RR": {"attempt": 0, "ok": 0},
+            "RG": {"attempt": 0, "ok": 0},
+            "GG": {"attempt": 0, "ok": 0},
+        }
+
         for idx, node in self.cells.items():
             if node.is_blocked: continue
             r, c = idx
@@ -446,6 +497,10 @@ class CellManager:
                                 idx, (nr, nc), obs_map, pred_mean_map, edge_type
                             )
 
+                        edge_stats[edge_type]["attempt"] += 1
+                        if ok:
+                            edge_stats[edge_type]["ok"] += 1
+
                         self._log_edge_debug(
                             edge_type,
                             _info["portal"],
@@ -461,6 +516,58 @@ class CellManager:
                                 self.edge_costs[edge_key] = self._edge_risk_cost(
                                     idx, (nr, nc), self._p_occ_map
                                 )
+
+        if self.debug_cfg.get("graph_debug_risk_stats", False):
+            total_cells = len(self.cells)
+            real_cells = sum(
+                1 for cell in self.cells.values() if (not cell.is_ghost and not cell.is_blocked)
+            )
+            ghost_cells = sum(
+                1 for cell in self.cells.values() if (cell.is_ghost and not cell.is_blocked)
+            )
+            blocked_cells = sum(1 for cell in self.cells.values() if cell.is_blocked)
+            if total_cells:
+                rows = [idx[0] for idx in self.cells.keys()]
+                cols = [idx[1] for idx in self.cells.keys()]
+                idx_range = f"r=[{min(rows)},{max(rows)}], c=[{min(cols)},{max(cols)}]"
+            else:
+                idx_range = "n/a"
+
+            print(
+                "[GRAPH][STATS] "
+                f"cells total={total_cells} real={real_cells} ghost={ghost_cells} blocked={blocked_cells} "
+                f"idx_range={idx_range}"
+            )
+            print(
+                "[GRAPH][STATS] "
+                f"potential={potential_count} processed={processed_count} skipped_outside={skipped_outside} "
+                f"max_ghost_distance={max_ghost_distance}"
+            )
+            print(
+                "[GRAPH][EDGES] "
+                f"RR {edge_stats['RR']['ok']}/{edge_stats['RR']['attempt']} "
+                f"RG {edge_stats['RG']['ok']}/{edge_stats['RG']['attempt']} "
+                f"GG {edge_stats['GG']['ok']}/{edge_stats['GG']['attempt']}"
+            )
+
+            if self._p_occ_map is not None:
+                p_occ = self._p_occ_map
+                print(
+                    "[GRAPH][POCC] "
+                    f"min={float(np.min(p_occ)):.3f} mean={float(np.mean(p_occ)):.3f} "
+                    f"max={float(np.max(p_occ)):.3f}"
+                )
+                unknown_ratio = float(np.mean(obs_map == 0.5))
+                print(f"[GRAPH][POCC] unknown_ratio={unknown_ratio:.3f}")
+
+            if self.edge_costs:
+                edge_vals = np.fromiter(self.edge_costs.values(), dtype=float)
+                zero_ratio = float(np.mean(edge_vals <= 1e-6))
+                print(
+                    "[GRAPH][COST] "
+                    f"min={float(np.min(edge_vals)):.6f} mean={float(np.mean(edge_vals)):.6f} "
+                    f"max={float(np.max(edge_vals)):.6f} zero_ratio={zero_ratio:.3f}"
+                )
     
     def _build_cost_grid(self, obs_map, pred_mean_map=None, edge_type="RR"):
         unknown_as_occ = self.connectivity_cfg.get("graph_unknown_as_occ", True)
@@ -508,7 +615,7 @@ class CellManager:
             ok, path_len, reason, last_step = entry
             ttl_left = cache_ttl - (self._mini_astar_step - last_step)
             if ttl_left > 0:
-                return ok, path_len, reason, "hit", ttl_left
+                return ok, path_len, reason, "hit", ttl_left, None
 
         c1 = self.get_cell_center(node_idx)
         c2 = self.get_cell_center(neighbor_idx)
@@ -529,7 +636,7 @@ class CellManager:
         if min_r >= max_r or min_c >= max_c:
             result = (False, 0, "empty_patch")
             self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
-            return result[0], result[1], result[2], "miss", cache_ttl
+            return result[0], result[1], result[2], "miss", cache_ttl, None
 
         local_patch = obs_map[min_r:max_r, min_c:max_c]
         start_local = (int(c1[0] - min_r), int(c1[1] - min_c))
@@ -538,21 +645,22 @@ class CellManager:
         if not (0 <= start_local[0] < local_patch.shape[0] and 0 <= start_local[1] < local_patch.shape[1]):
             result = (False, 0, "out_of_bounds")
             self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
-            return result[0], result[1], result[2], "miss", cache_ttl
+            return result[0], result[1], result[2], "miss", cache_ttl, None
         if not (0 <= end_local[0] < local_patch.shape[0] and 0 <= end_local[1] < local_patch.shape[1]):
             result = (False, 0, "out_of_bounds")
             self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
-            return result[0], result[1], result[2], "miss", cache_ttl
+            return result[0], result[1], result[2], "miss", cache_ttl, None
 
         cost = self._build_cost_grid(local_patch, None, edge_type="RR")
         path = pyastar2d.astar_path(cost, start_local, end_local, allow_diagonal=False)
         if path is None:
-            result = (False, 0, "no_path")
+            result = (False, 0, "no_path", None)
         else:
-            result = (True, int(path.shape[0]), "ok")
+            global_path = [(int(p[0] + min_r), int(p[1] + min_c)) for p in path]
+            result = (True, int(path.shape[0]), "ok", global_path)
 
-        self._mini_astar_cache[cache_key] = (*result, self._mini_astar_step)
-        return result[0], result[1], result[2], "miss", cache_ttl
+        self._mini_astar_cache[cache_key] = (*result[:3], self._mini_astar_step)
+        return result[0], result[1], result[2], "miss", cache_ttl, result[3]
 
     def _boundary_wall_ratio(self, obs_map, node_idx, neighbor_idx):
         centroid1 = self.get_cell_center(node_idx)
@@ -583,6 +691,32 @@ class CellManager:
         if edge_key in self.debug_edge_samples:
             samples = self._collect_line_samples(node_idx, neighbor_idx, obs_map)
             print(f"[RR DEBUG] edge={edge_key} line_samples={samples}")
+        cached = self._rr_edge_cache.get(edge_key)
+        if cached is not None:
+            if cached.get("blocked"):
+                return False, {
+                    "portal": None,
+                    "los": False,
+                    "mini": None,
+                    "cache": "stale",
+                    "ttl_left": None,
+                }
+            if self._samples_blocked(cached["samples"], obs_map):
+                cached["blocked"] = True
+                return False, {
+                    "portal": None,
+                    "los": False,
+                    "mini": None,
+                    "cache": "stale",
+                    "ttl_left": None,
+                }
+            return True, {
+                "portal": None,
+                "los": None,
+                "mini": None,
+                "cache": "hit",
+                "ttl_left": None,
+            }
         portal_ok = False
         if free_mask is not None:
             thickness = self.connectivity_cfg.get("graph_portal_thickness", 2)
@@ -590,35 +724,42 @@ class CellManager:
 
         los_ok = self._check_path_clear(node_idx, neighbor_idx, obs_map)
         if portal_ok and los_ok:
+            samples = self._get_clear_los_samples(node_idx, neighbor_idx, obs_map)
+            if samples:
+                self._rr_edge_cache[edge_key] = {"samples": samples, "blocked": False}
             return True, {
                 "portal": True,
                 "los": True,
                 "mini": None,
-                "cache": "skip",
+                "cache": "miss",
                 "ttl_left": None,
             }
 
         if portal_ok and not los_ok:
-            ok, path_len, reason, cache_status, ttl_left = self._run_mini_astar_local_rr(
+            ok, path_len, reason, cache_status, ttl_left, path_samples = self._run_mini_astar_local_rr(
                 node_idx, neighbor_idx, obs_map
             )
+            if ok and path_samples:
+                self._rr_edge_cache[edge_key] = {"samples": path_samples, "blocked": False}
             return ok, {
                 "portal": True,
                 "los": False,
                 "mini": (ok, path_len, reason),
-                "cache": cache_status,
+                "cache": "miss" if cache_status == "miss" else cache_status,
                 "ttl_left": ttl_left,
             }
 
         if not portal_ok and self._should_fallback_when_portal_false(obs_map, node_idx, neighbor_idx):
-            ok, path_len, reason, cache_status, ttl_left = self._run_mini_astar_local_rr(
+            ok, path_len, reason, cache_status, ttl_left, path_samples = self._run_mini_astar_local_rr(
                 node_idx, neighbor_idx, obs_map
             )
+            if ok and path_samples:
+                self._rr_edge_cache[edge_key] = {"samples": path_samples, "blocked": False}
             return ok, {
                 "portal": False,
                 "los": False,
                 "mini": (ok, path_len, reason),
-                "cache": cache_status,
+                "cache": "miss" if cache_status == "miss" else cache_status,
                 "ttl_left": ttl_left,
             }
 
@@ -631,16 +772,34 @@ class CellManager:
         }
 
     def _check_ghost_edge(self, node_idx, neighbor_idx, obs_map, pred_mean_map, edge_type):
-        cost = self._build_cost_grid(obs_map, pred_mean_map, edge_type=edge_type)
-        ok, path_len, reason, cache_status, ttl_left = self._run_mini_astar(
-            node_idx, neighbor_idx, cost, edge_type
-        )
-        return ok, {
+        obs_blocked = self._edge_strip_any_above(node_idx, neighbor_idx, obs_map, 0.8)
+        if obs_blocked:
+            return False, {
+                "portal": None,
+                "los": False,
+                "mini": None,
+                "cache": "skip",
+                "ttl_left": None,
+            }
+
+        pred_hard = float(self.connectivity_cfg.get("graph_pred_hard_wall_threshold", 0.95))
+        pred_mean_map = self._align_pred_map(pred_mean_map, obs_map.shape, fill_value=1.0)
+        pred_blocked = self._edge_strip_any_above(node_idx, neighbor_idx, pred_mean_map, pred_hard)
+        if pred_blocked:
+            return False, {
+                "portal": None,
+                "los": False,
+                "mini": None,
+                "cache": "skip",
+                "ttl_left": None,
+            }
+
+        return True, {
             "portal": None,
-            "los": None,
-            "mini": (ok, path_len, reason),
-            "cache": cache_status,
-            "ttl_left": ttl_left,
+            "los": True,
+            "mini": None,
+            "cache": "skip",
+            "ttl_left": None,
         }
 
     def _log_edge_debug(self, edge_type, portal, los, mini, cache_status, ttl_left):
@@ -878,6 +1037,70 @@ class CellManager:
         mean_occ = float(np.clip(mean_occ, 0.0, 1.0))
         p_free = max(1.0 - mean_occ, eps)
         return float(-np.log(p_free))
+
+    def _edge_strip_max(self, node_idx, neighbor_idx, grid):
+        if grid is None:
+            return None
+
+        strip_div = max(1, int(self.connectivity_cfg.get("graph_edge_risk_strip_divisor", 6)))
+        thickness = max(1, int(self.cell_size // strip_div))
+
+        h, w = grid.shape
+        a_center = self.get_cell_center(node_idx).astype(int)
+        b_center = self.get_cell_center(neighbor_idx).astype(int)
+        half = self.cell_size // 2
+
+        a_r0 = max(0, int(a_center[0] - half))
+        a_r1 = min(h, int(a_center[0] + half))
+        a_c0 = max(0, int(a_center[1] - half))
+        a_c1 = min(w, int(a_center[1] + half))
+
+        b_r0 = max(0, int(b_center[0] - half))
+        b_r1 = min(h, int(b_center[0] + half))
+        b_c0 = max(0, int(b_center[1] - half))
+        b_c1 = min(w, int(b_center[1] + half))
+
+        dr = neighbor_idx[0] - node_idx[0]
+        dc = neighbor_idx[1] - node_idx[1]
+
+        max_val = None
+
+        if dr == 0 and dc == 1:
+            a_strip = grid[a_r0:a_r1, max(a_c1 - thickness, a_c0):a_c1]
+            b_strip = grid[b_r0:b_r1, b_c0:min(b_c0 + thickness, b_c1)]
+            if a_strip.size:
+                max_val = float(np.max(a_strip))
+            if b_strip.size:
+                max_val = float(np.max(b_strip)) if max_val is None else max(max_val, float(np.max(b_strip)))
+        elif dr == 0 and dc == -1:
+            a_strip = grid[a_r0:a_r1, a_c0:min(a_c0 + thickness, a_c1)]
+            b_strip = grid[b_r0:b_r1, max(b_c1 - thickness, b_c0):b_c1]
+            if a_strip.size:
+                max_val = float(np.max(a_strip))
+            if b_strip.size:
+                max_val = float(np.max(b_strip)) if max_val is None else max(max_val, float(np.max(b_strip)))
+        elif dr == 1 and dc == 0:
+            a_strip = grid[max(a_r1 - thickness, a_r0):a_r1, a_c0:a_c1]
+            b_strip = grid[b_r0:min(b_r0 + thickness, b_r1), b_c0:b_c1]
+            if a_strip.size:
+                max_val = float(np.max(a_strip))
+            if b_strip.size:
+                max_val = float(np.max(b_strip)) if max_val is None else max(max_val, float(np.max(b_strip)))
+        elif dr == -1 and dc == 0:
+            a_strip = grid[a_r0:min(a_r0 + thickness, a_r1), a_c0:a_c1]
+            b_strip = grid[max(b_r1 - thickness, b_r0):b_r1, b_c0:b_c1]
+            if a_strip.size:
+                max_val = float(np.max(a_strip))
+            if b_strip.size:
+                max_val = float(np.max(b_strip)) if max_val is None else max(max_val, float(np.max(b_strip)))
+
+        return max_val
+
+    def _edge_strip_any_above(self, node_idx, neighbor_idx, grid, threshold):
+        max_val = self._edge_strip_max(node_idx, neighbor_idx, grid)
+        if max_val is None:
+            return False
+        return bool(max_val >= threshold)
 
     def _align_pred_map(self, pred_map, obs_shape, fill_value=1.0):
         if pred_map is None or obs_shape is None:

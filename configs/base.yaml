@@ -45,13 +45,14 @@ nbh:
   graph_ghost_pred_var_max_threshold: 0.3
 
   # Connectivity / collision
-  graph_unknown_as_occ: true
-  graph_pred_wall_threshold: 0.7
-  graph_mini_astar_ttl_steps: 10
+  graph_unknown_as_occ: true           # unknown treated as occupied in RR mini-A*
+  graph_pred_wall_threshold: 0.7       # legacy predicted-wall cutoff
+  graph_pred_hard_wall_threshold: 0.95 # ghost edge hard-block threshold
+  graph_mini_astar_ttl_steps: 10       # mini-A* cache TTL (steps)
 
   # Edge risk
-  graph_edge_risk_strip_divisor: 6
-  graph_edge_risk_eps: 1e-4
+  graph_edge_risk_strip_divisor: 6     # strip thickness divisor for risk sampling
+  graph_edge_risk_eps: 1e-4            # epsilon for -log(p_free)
 
   # Target scoring
   graph_target_risk_lambda: 0.5
@@ -73,8 +74,9 @@ nbh:
     # - [[-8, 11], [-9, 11]]
     # - [[-1, 12], [-2, 12]]
     # - [[-1, 13], [-2, 13]]
-  graph_debug_targets: false
+  graph_debug_targets: true
   graph_debug_belief: false
+  graph_debug_risk_stats: true
   graph_debug_propagation_stats: false
   graph_debug_local_astar: false
   graph_debug_los_viz: true
@@ -129,7 +131,7 @@ upen_config:
 # LIDAR SIMULATION
 # ============================================================================
 lidar_sim_configs:
-  laser_range_m: 20
+  laser_range_m: 15
   num_laser: 2500
   pixel_per_meter: 10
   dilate_diam_for_planning: 3
