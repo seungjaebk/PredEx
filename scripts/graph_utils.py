@@ -50,6 +50,7 @@ class CellManager:
         promotion_cfg=None,
         connectivity_cfg=None,
         debug_cfg=None,
+        map_origin=None,
     ):
         """
         Robot-centric cell manager for unknown map exploration.
@@ -58,6 +59,9 @@ class CellManager:
             cell_size: Size of each cell in pixels
             start_pose: Robot's starting position [row, col] - becomes centroid of cell (0, 0)
             valid_space_map: Optional valid space map (for reference only, not used for ghost creation)
+            map_origin: (row, col) offset for the actual map origin within the padded map.
+                        Typically this is (pd_size, pd_size) where pd_size is the padding size.
+                        If None, defaults to (0, 0) which assumes no padding.
         """
         self.cell_size = cell_size
         self.free_mask = None
@@ -65,6 +69,12 @@ class CellManager:
         self.promotion_cfg = promotion_cfg or {}
         self.connectivity_cfg = connectivity_cfg or {}
         self.debug_cfg = debug_cfg or {}
+        
+        # Map origin offset: pixel coordinate where the actual map starts within the padded map
+        if map_origin is not None:
+            self.map_origin = np.array(map_origin, dtype=float)
+        else:
+            self.map_origin = np.array([0.0, 0.0], dtype=float)
         
         # Origin retained for backward compatibility; absolute indexing is used.
         self.origin = np.array(start_pose, dtype=float) if start_pose is not None else None
@@ -102,6 +112,122 @@ class CellManager:
         if patch is None or patch.size == 0:
             return default
         return float(np.mean(patch))
+
+    def _get_cell_variance(self, idx, pred_var_map):
+        """Get variance for a cell from pred_var_map."""
+        if pred_var_map is None:
+            return 1.0
+        center = self.get_cell_center(idx)
+        h, w = pred_var_map.shape
+        r, c = int(center[0]), int(center[1])
+        if 0 <= r < h and 0 <= c < w:
+            return float(pred_var_map[r, c])
+        return 1.0
+
+    def _get_frontier_seeds(self, obs_map):
+        """
+        Get frontier Real cells (Real cells adjacent to Unknown).
+        These are the "coastline" between known and unknown regions.
+        """
+        seeds = []
+        for idx, cell in self.cells.items():
+            if cell.is_ghost or cell.is_blocked:
+                continue
+            # Check if any neighbor is Unknown (not in cells or in unknown region)
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                n_idx = (idx[0] + dr, idx[1] + dc)
+                if n_idx not in self.cells:
+                    # Neighbor doesn't exist = potential unknown
+                    seeds.append(idx)
+                    break
+        return seeds
+
+    def generate_ghost_cells_adaptive(self, obs_map, pred_var_map, pred_mean_map=None):
+        """
+        Generate ghost cells using frontier-seeded confidence propagation.
+        
+        Seeds: Frontier Real Cells (Real cells adjacent to Unknown)
+        Propagation: confidence × (1 - variance)
+        Stop when: confidence < min_confidence
+        
+        This replaces the old variance-threshold based ghost generation.
+        """
+        import heapq
+        
+        min_conf = float(self.connectivity_cfg.get("ghost_min_confidence", 0.2))
+        pred_free_threshold = float(self.connectivity_cfg.get("graph_pred_wall_threshold", 0.7))
+        
+        # Get frontier seeds
+        seeds = self._get_frontier_seeds(obs_map)
+        if not seeds:
+            return
+        
+        # Priority queue: (-confidence, idx) for max-heap behavior
+        queue = []
+        visited = {}
+        
+        for seed_idx in seeds:
+            heapq.heappush(queue, (-1.0, seed_idx))
+            visited[seed_idx] = 1.0
+        
+        # Get map bounds
+        h, w = obs_map.shape
+        
+        new_ghosts = 0
+        
+        while queue:
+            neg_conf, idx = heapq.heappop(queue)
+            conf = -neg_conf
+            
+            if conf < min_conf:
+                continue
+            
+            # Propagate to neighbors
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                n_idx = (idx[0] + dr, idx[1] + dc)
+                
+                # No negative indices allowed
+                if n_idx[0] < 0 or n_idx[1] < 0:
+                    continue
+                
+                # STRICT bounds check: cell center must be inside map
+                center = self.get_cell_center(n_idx)
+                r, c = int(center[0]), int(center[1])
+                if r < 0 or r >= h or c < 0 or c >= w:
+                    continue  # Cell center outside map
+                
+                # Skip if already Real cell
+                existing = self.cells.get(n_idx)
+                if existing is not None and not existing.is_ghost:
+                    continue
+                
+                # Check if predicted as free (not wall)
+                if pred_mean_map is not None:
+                    pred_occ = float(pred_mean_map[r, c])
+                    if pred_occ >= pred_free_threshold:
+                        continue  # Predicted wall, don't expand
+                # Calculate new confidence with system noise
+                # - model_var: prediction uncertainty
+                # - system_noise: intrinsic uncertainty (odometry, dynamics)
+                model_var = float(pred_var_map[r, c]) if pred_var_map is not None else 1.0
+                system_noise = float(self.connectivity_cfg.get("ghost_system_noise", 0.1))
+                effective_var = min(1.0, model_var + system_noise)
+                new_conf = conf * (1.0 - effective_var)
+                
+                if new_conf > min_conf and new_conf > visited.get(n_idx, 0):
+                    visited[n_idx] = new_conf
+                    
+                    # Create or update ghost cell
+                    node = self.get_cell(n_idx)
+                    node.is_ghost = True
+                    node.is_blocked = False
+                    node.base_value = model_var  # Store model variance as information value
+                    
+                    heapq.heappush(queue, (-new_conf, n_idx))
+                    new_ghosts += 1
+        
+        if self.debug_cfg.get("graph_debug_ghosts"):
+            print(f"[GHOST] Generated {new_ghosts} ghost cells from {len(seeds)} frontier seeds")
 
     def _map_change_ratio(self, prev, curr):
         if prev is None:
@@ -165,6 +291,46 @@ class CellManager:
 
         return points, (has_sample and not blocked)
 
+    def _line_max(self, node_idx, neighbor_idx, grid, threshold=None):
+        """
+        Get max value along center-to-center line between two cells.
+        Cell-size independent - checks the FULL path between cell centers.
+        
+        Args:
+            node_idx: Source cell index
+            neighbor_idx: Target cell index
+            grid: Value grid (obs_map or pred_map)
+            threshold: Optional - if provided, return True if any value >= threshold
+        
+        Returns:
+            If threshold is None: max value along path (or None if invalid)
+            If threshold is not None: True if any value >= threshold
+        """
+        if grid is None:
+            return None if threshold is None else False
+            
+        centroid1 = self.get_cell_center(node_idx)
+        centroid2 = self.get_cell_center(neighbor_idx)
+        h, w = grid.shape
+        
+        # Sample along line (use cell_size samples for resolution)
+        num_samples = max(self.cell_size, 10)
+        max_val = None
+        
+        for i in range(num_samples + 1):
+            t = i / num_samples
+            r = int(centroid1[0] * (1 - t) + centroid2[0] * t)
+            c = int(centroid1[1] * (1 - t) + centroid2[1] * t)
+            
+            if 0 <= r < h and 0 <= c < w:
+                val = float(grid[r, c])
+                if threshold is not None and val >= threshold:
+                    return True
+                if max_val is None or val > max_val:
+                    max_val = val
+        
+        return max_val if threshold is None else False
+
     def _samples_blocked(self, samples, obs_map):
         if not samples:
             return True
@@ -201,71 +367,17 @@ class CellManager:
                 return [(r, c) for r, c, _ in points]
         return []
 
-    def _save_los_debug_plot(self, node_idx, neighbor_idx, obs_map, line_results):
-        if not self.los_viz_dir:
-            return
-        try:
-            import matplotlib.pyplot as plt
-        except Exception:
-            return
-
-        centroid1 = self.get_cell_center(node_idx)
-        centroid2 = self.get_cell_center(neighbor_idx)
-        rows = [centroid1[0], centroid2[0]]
-        cols = [centroid1[1], centroid2[1]]
-        for line in line_results:
-            for r, c, _ in line["points"]:
-                rows.append(r)
-                cols.append(c)
-
-        margin = int(self.cell_size * 2)
-        r_min = max(int(min(rows) - margin), 0)
-        r_max = min(int(max(rows) + margin), obs_map.shape[0] - 1)
-        c_min = max(int(min(cols) - margin), 0)
-        c_max = min(int(max(cols) + margin), obs_map.shape[1] - 1)
-
-        crop = obs_map[r_min:r_max + 1, c_min:c_max + 1]
-        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-        ax.imshow(crop, cmap="gray", vmin=0, vmax=1)
-
-        for line in line_results:
-            points = line["points"]
-            if not points:
-                continue
-            color = "blue" if line["clear"] else "red"
-            xs = [p[1] - c_min for p in points]
-            ys = [p[0] - r_min for p in points]
-            ax.plot(xs, ys, color=color, linewidth=2)
-
-        ax.scatter(
-            [centroid1[1] - c_min, centroid2[1] - c_min],
-            [centroid1[0] - r_min, centroid2[0] - r_min],
-            c="cyan",
-            s=30,
-            marker="o",
-            edgecolors="black",
-            linewidths=0.5,
-        )
-        ax.set_title(f"LOS {node_idx} <-> {neighbor_idx}")
-        ax.axis("off")
-
-        filename = (
-            f"los_{node_idx[0]}_{node_idx[1]}_"
-            f"{neighbor_idx[0]}_{neighbor_idx[1]}_"
-            f"{self._los_viz_counter:04d}.png"
-        )
-        fig.savefig(os.path.join(self.los_viz_dir, filename), dpi=200)
-        plt.close(fig)
-        self._los_viz_counter += 1
-
+   
     def get_cell_index(self, pixel_pose):
         """
         Convert pixel (row, col) to absolute cell index (r, c).
 
-        Cell (0, 0) corresponds to the top-left of the map.
+        Cell (0, 0) corresponds to the top-left of the ACTUAL map (after map_origin offset).
+        Pixel coordinates should be in the padded map coordinate system.
         """
-        r = int(np.floor(pixel_pose[0] / self.cell_size))
-        c = int(np.floor(pixel_pose[1] / self.cell_size))
+        # Subtract map_origin to get coordinates relative to actual map
+        r = int(np.floor((pixel_pose[0] - self.map_origin[0]) / self.cell_size))
+        c = int(np.floor((pixel_pose[1] - self.map_origin[1]) / self.cell_size))
         return (r, c)
 
     def get_cell_center(self, cell_idx):
@@ -273,14 +385,15 @@ class CellManager:
         Get absolute pixel coordinates of cell centroid.
         
         Args:
-            cell_idx: (r, c) tuple in absolute grid coordinates
+            cell_idx: (r, c) tuple in cell grid coordinates (relative to actual map)
             
         Returns:
-            np.array([row, col]) in absolute pixel coordinates
+            np.array([row, col]) in absolute pixel coordinates (padded map system)
         """
         r, c = cell_idx
-        center_r = (r + 0.5) * self.cell_size
-        center_c = (c + 0.5) * self.cell_size
+        # Cell center in actual map coordinates, then add map_origin to get padded coords
+        center_r = (r + 0.5) * self.cell_size + self.map_origin[0]
+        center_c = (c + 0.5) * self.cell_size + self.map_origin[1]
         return np.array([center_r, center_c])
 
     def get_cell(self, index, create_if_missing=True, is_ghost=False):
@@ -325,8 +438,14 @@ class CellManager:
         # --- 1. UPDATE REAL NODES (Observed) ---
         potential_indices = set()
         distances = {}
-        rows = int(np.ceil(map_h / self.cell_size))
-        cols = int(np.ceil(map_w / self.cell_size))
+        # Calculate cell grid dimensions based on ACTUAL map region (after map_origin offset)
+        # The actual map starts at map_origin and extends to (map_h - map_origin[0], map_w - map_origin[1])
+        # But we need to account for both padding sides, so actual map size is:
+        # (map_h - 2 * map_origin[0], map_w - 2 * map_origin[1])
+        actual_map_h = map_h - 2 * int(self.map_origin[0])
+        actual_map_w = map_w - 2 * int(self.map_origin[1])
+        rows = int(np.ceil(actual_map_h / self.cell_size))
+        cols = int(np.ceil(actual_map_w / self.cell_size))
 
         if grid_policy == "full_map":
             for r in range(rows):
@@ -410,9 +529,15 @@ class CellManager:
             if centroid_obs_val >= centroid_blocked_threshold:
                 is_obs_blocked = True
             
-            # Check Unknown status (patch-based)
+            # Check Unknown status (patch-based AND centroid-based)
+            # A cell is REAL only if:
+            #   1. Patch is mostly observed (unknown_ratio <= threshold), AND
+            #   2. Centroid is observed (not 0.5)
+            # Otherwise, treat as unknown (potential Ghost candidate)
             unknown_ratio = float(np.mean(patch_obs == 0.5))
-            is_unknown = (unknown_ratio > unknown_ratio_threshold)
+            centroid_observed = (centroid_obs_val != 0.5)  # centroid is not unknown
+            # is_unknown if: patch is mostly unknown OR centroid is not observed
+            is_unknown = (unknown_ratio > unknown_ratio_threshold) or not centroid_observed
             
             # Check Prediction status (Ghost)
             # If unknown but Predicted Free, it's a Ghost Candidate
@@ -440,40 +565,66 @@ class CellManager:
                     f"is_obs_blocked={is_obs_blocked} ghost_distance={ghost_distance}"
                 )
             
+            
             # Node Creation / Update Logic
+            # IMPORTANT: Every cell in potential_indices must be explicitly classified.
+            # We DO NOT skip any case - this prevents stale cell states.
+            
             if is_obs_blocked:
-                # Mark blocked
+                # BLOCKED: Observed obstacle
                 node = self.get_cell(idx)
                 node.is_blocked = True
+                node.is_ghost = False
                 node.base_value = 0.0
+                
             elif not is_unknown:
-                # Real Free Space
-                node = self.get_cell(idx, is_ghost=False)
+                # REAL: Observed free space
+                node = self.get_cell(idx)
                 node.is_blocked = False
                 node.is_ghost = False
-                node.base_value = 0.0 # Visited/Known = Boring (unless we add semantic bonus later)
+                node.base_value = 0.0
+                
             elif is_unknown and is_pred_free:
-                # GHOST NODE - but only if uncertainty is LOW enough
-                # High variance = uncertain = don't trust the prediction
-                cell_variance = 1.0  # Default high (don't expand)
-                var_patch = None
+                # GHOST CANDIDATE: Unknown but predicted free
+                cell_variance = 1.0
                 if pred_var_map is not None:
                     var_patch = pred_var_map[y_start_clip:y_end_clip, x_start_clip:x_end_clip]
-                cell_variance = self._patch_mean(var_patch, default=1.0)
+                    cell_variance = self._patch_mean(var_patch, default=1.0)
                 
-                # Only create ghost if:
-                # 1. Variance is below threshold (model is confident it's free)
-                # 2. Distance from real cell is reasonable (still need some limit)
-                ghost_distance = distances.get(idx, float('inf'))
+                # Check if has confident neighbor (Real or confident Ghost)
+                has_confident_neighbor = False
+                for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
+                    neighbor_idx = (idx[0]+dr, idx[1]+dc)
+                    neighbor = self.cells.get(neighbor_idx)
+                    if neighbor is not None and not neighbor.is_blocked:
+                        if not neighbor.is_ghost:
+                            has_confident_neighbor = True
+                            break
+                        elif neighbor.base_value < pred_var_max_threshold:
+                            has_confident_neighbor = True
+                            break
+                
                 if cell_variance < pred_var_max_threshold and (
-                    grid_policy == "full_map" or ghost_distance <= max_ghost_distance
+                    grid_policy == "full_map" or has_confident_neighbor
                 ):
-                    node = self.get_cell(idx, is_ghost=True)
+                    # GHOST: Confident prediction
+                    node = self.get_cell(idx)
                     node.is_blocked = False
-                    node.base_value = cell_variance  # Store actual variance
+                    node.is_ghost = True
+                    node.base_value = cell_variance
+                else:
+                    # BLOCKED: Uncertain prediction or no confident neighbor
+                    node = self.get_cell(idx)
+                    node.is_blocked = True
+                    node.is_ghost = False
+                    node.base_value = 1.0
+                    
             else:
-                # Unknown and Predicted Blocked/Unknown -> Don't add to graph (Wall in Fog)
-                pass
+                # BLOCKED: Unknown and not predicted free (Wall in Fog)
+                node = self.get_cell(idx)
+                node.is_blocked = True
+                node.is_ghost = False
+                node.base_value = 1.0
 
         self.last_graph_stats = {
             "potential": potential_count,
@@ -607,12 +758,20 @@ class CellManager:
         pred_wall_threshold = self.connectivity_cfg.get("graph_pred_wall_threshold", 0.7)
 
         cost = np.ones_like(obs_map, dtype=np.float32)
-        cost[obs_map >= 0.8] = np.inf
-        if unknown_as_occ:
+        cost[obs_map >= 0.8] = np.inf  # Observed walls always blocked
+        
+        # For ghost edges (RG/GG), use prediction to fill unknown regions
+        if edge_type in ("RG", "GG") and pred_mean_map is not None:
+            unknown_mask = (obs_map == 0.5)
+            # Prediction > threshold = blocked, otherwise passable with cost
+            pred_blocked = (pred_mean_map > pred_wall_threshold)
+            cost[unknown_mask & pred_blocked] = np.inf
+            # Low prediction = free, use prediction as cost bonus
+            cost[unknown_mask & ~pred_blocked] = 1.0 + pred_mean_map[unknown_mask & ~pred_blocked]
+        elif unknown_as_occ:
+            # For real-real edges, unknown = blocked
             cost[obs_map == 0.5] = np.inf
 
-        if edge_type in ("RG", "GG") and pred_mean_map is not None:
-            cost[pred_mean_map > pred_wall_threshold] = np.inf
         return cost
 
     def _run_mini_astar(self, node_idx, neighbor_idx, cost_grid, edge_type):
@@ -809,31 +968,77 @@ class CellManager:
         }
 
     def _check_ghost_edge(self, node_idx, neighbor_idx, obs_map, pred_mean_map, edge_type):
-        obs_blocked = self._edge_strip_any_above(node_idx, neighbor_idx, obs_map, 0.8)
+        # Check OBSERVED wall along center-to-center line (cell-size independent)
+        # Block if any pixel >= 0.9 (occupied) along the full path
+        obs_blocked = self._line_max(node_idx, neighbor_idx, obs_map, threshold=0.9)
         if obs_blocked:
             return False, {
                 "portal": None,
                 "los": False,
-                "mini": None,
+                "mini": "obs_wall",
                 "cache": "skip",
                 "ttl_left": None,
             }
-
-        pred_hard = float(self.connectivity_cfg.get("graph_pred_hard_wall_threshold", 0.95))
-        pred_mean_map = self._align_pred_map(pred_mean_map, obs_map.shape, fill_value=1.0)
-        pred_blocked = self._edge_strip_any_above(node_idx, neighbor_idx, pred_mean_map, pred_hard)
+        
+        # Get prediction wall threshold from config
+        pred_wall_threshold = float(self.connectivity_cfg.get("graph_pred_wall_threshold", 0.7))
+        
+        pred_mean_map_aligned = self._align_pred_map(pred_mean_map, obs_map.shape, fill_value=1.0)
+        
+        # Check PREDICTED wall along center-to-center line (cell-size independent)
+        # Block if any pixel >= threshold along the full path
+        pred_blocked = self._line_max(node_idx, neighbor_idx, pred_mean_map_aligned, threshold=pred_wall_threshold)
         if pred_blocked:
             return False, {
                 "portal": None,
                 "los": False,
+                "mini": "pred_wall",
+                "cache": "skip",
+                "ttl_left": None,
+            }
+        
+        # Check line-of-sight along the full centroid-to-centroid path
+        los_clear = self._check_path_clear(node_idx, neighbor_idx, obs_map, involves_ghost=True)
+        
+        if los_clear:
+            return True, {
+                "portal": None,
+                "los": True,
                 "mini": None,
                 "cache": "skip",
                 "ttl_left": None,
             }
-
-        return True, {
+        
+        # LOS failed - mini-A* fallback for both GG and RG edges
+        # This allows risk-based connectivity instead of binary disconnect
+        if edge_type in ("GG", "RG"):
+            cost_grid = self._build_cost_grid(obs_map, pred_mean_map_aligned, edge_type=edge_type)
+            mini_ok, path_len, mini_reason, cache_status, ttl_left = self._run_mini_astar(
+                node_idx, neighbor_idx, cost_grid, edge_type
+            )
+            
+            if mini_ok:
+                return True, {
+                    "portal": None,
+                    "los": False,
+                    "mini": (mini_ok, path_len, mini_reason),
+                    "cache": cache_status,
+                    "ttl_left": ttl_left,
+                }
+            
+            # mini-A* also failed
+            return False, {
+                "portal": None,
+                "los": False,
+                "mini": (mini_ok, path_len, mini_reason),
+                "cache": cache_status,
+                "ttl_left": ttl_left,
+            }
+        
+        # RR edge: LOS failed, no fallback (real-real should be strictly observed)
+        return False, {
             "portal": None,
-            "los": True,
+            "los": False,
             "mini": None,
             "cache": "skip",
             "ttl_left": None,
@@ -882,8 +1087,6 @@ class CellManager:
         elif dc == 0 and dr != 0:
             offsets = [(0, -1), (0, 1)]
         else:
-            if want_viz:
-                self._save_los_debug_plot(node_idx, neighbor_idx, obs_map, line_results)
             return False
         overall_ok = clear
         for off_r, off_c in offsets:
@@ -894,9 +1097,6 @@ class CellManager:
             if clear and not want_viz:
                 return True
             overall_ok = overall_ok or clear
-
-        if want_viz:
-            self._save_los_debug_plot(node_idx, neighbor_idx, obs_map, line_results)
 
         return overall_ok
 
@@ -1504,7 +1704,7 @@ class CellManager:
         # Current cell not in path - path may be stale
         return None, "OFF_PATH"
     
-    def find_exploration_target(self, pred_var_map, current_cell=None):
+    def find_exploration_target(self, pred_var_map, current_cell=None, exclude_cells=None):
         """
         Find the best exploration target (highest uncertainty/value cell).
         Called when current target is reached or invalid.
@@ -1518,10 +1718,14 @@ class CellManager:
         Args:
             pred_var_map: Prediction variance map for diffusion
             current_cell: Current cell the robot is in (required for reachability check)
+            exclude_cells: Set of cell indices to exclude from selection (e.g., blacklisted stale targets)
         
         Returns:
             target_cell: Best reachable cell to explore (ghost or real), or None if none found
         """
+        if exclude_cells is None:
+            exclude_cells = set()
+        
         best_cell = None
         best_score = -1e9
         
@@ -1532,13 +1736,18 @@ class CellManager:
         risk_lambda = float(self._get_cfg("graph_target_risk_lambda", 0.5))
         dist = None
         prev = None
+        edge_count = None
         if current_cell is not None:
-            dist, prev = self._run_dijkstra(current_cell.index)
-            self._dijkstra_cache = (current_cell.index, dist, prev)
+            dist, prev, edge_count = self._run_dijkstra(current_cell.index)
+            self._dijkstra_cache = (current_cell.index, dist, prev, edge_count)
 
         # Find best cell (ghost OR real) among reachable cells based on score
         for cell in self.cells.values():
             if cell.is_blocked:
+                continue
+            
+            # Skip excluded (blacklisted) cells
+            if cell.index in exclude_cells:
                 continue
             
             # Skip current cell itself
@@ -1549,11 +1758,19 @@ class CellManager:
                 if dist is None:
                     continue
                 cost = dist.get(cell.index)
+                n_edges = edge_count.get(cell.index, 1) if edge_count else 1
                 if cost is None:
                     continue
-                score = cell.propagated_value - risk_lambda * cost
+                # Geometric mean path risk: normalize by number of edges
+                mean_risk = cost / max(1, n_edges)
+                # New formula: V' = base_value * exp(-λ * mean_risk)
+                score = cell.propagated_value * np.exp(-risk_lambda * mean_risk)
             else:
                 score = cell.propagated_value
+            
+            # Apply visit count penalty to prevent oscillation between recently visited cells
+            if cell.visit_count > 0:
+                score /= (1.0 + 0.5 * cell.visit_count)
                 
             # Select cell with highest score
             if score > best_score:
@@ -1576,15 +1793,25 @@ class CellManager:
         return best_cell
 
     def _run_dijkstra(self, start_idx):
+        """
+        Run Dijkstra's algorithm from start_idx.
+        
+        Returns:
+            dist: dict mapping cell_idx -> total path cost
+            prev: dict mapping cell_idx -> previous cell in path
+            edge_count: dict mapping cell_idx -> number of edges in path
+        """
         import heapq
 
         dist = {start_idx: 0.0}
+        edge_count = {start_idx: 0}
         prev = {}
-        heap = [(0.0, start_idx)]
+        # Heap key: (edge_count, cost, idx) - prioritize min edges, then min cost
+        heap = [(0, 0.0, start_idx)]
         visited = set()
 
         while heap:
-            curr_cost, curr_idx = heapq.heappop(heap)
+            curr_edges, curr_cost, curr_idx = heapq.heappop(heap)
             if curr_idx in visited:
                 continue
             visited.add(curr_idx)
@@ -1598,13 +1825,20 @@ class CellManager:
                     continue
                 edge_key = self._edge_key(curr_idx, neighbor.index)
                 edge_cost = self.edge_costs.get(edge_key, 1.0)
+                new_edges = curr_edges + 1
                 new_cost = curr_cost + edge_cost
-                if new_cost < dist.get(neighbor.index, float("inf")):
+                
+                # Lexicographic comparison: (edge_count, cost)
+                existing_edges = edge_count.get(neighbor.index, float("inf"))
+                existing_cost = dist.get(neighbor.index, float("inf"))
+                
+                if (new_edges, new_cost) < (existing_edges, existing_cost):
                     dist[neighbor.index] = new_cost
+                    edge_count[neighbor.index] = new_edges
                     prev[neighbor.index] = curr_idx
-                    heapq.heappush(heap, (new_cost, neighbor.index))
+                    heapq.heappush(heap, (new_edges, new_cost, neighbor.index))
 
-        return dist, prev
+        return dist, prev, edge_count
 
     def find_path_to_target(self, start_cell, target_cell):
         """
@@ -1620,7 +1854,7 @@ class CellManager:
 
         cached = self._dijkstra_cache
         if cached is not None:
-            cache_start, dist, prev = cached
+            cache_start, dist, prev, _ = cached  # Ignore edge_count for path
             if cache_start == start_cell.index and target_cell.index in dist:
                 path_indices = [target_cell.index]
                 while path_indices[-1] != start_cell.index:
@@ -1641,7 +1875,7 @@ class CellManager:
         if start_cell.index == target_cell.index:
             return [start_cell]
         
-        dist, prev = self._run_dijkstra(start_cell.index)
+        dist, prev, _ = self._run_dijkstra(start_cell.index)  # Ignore edge_count here
 
         if target_cell.index not in dist:
             print(f"  [PATH] NO PATH from {start_cell.index} to {target_cell.index}!")

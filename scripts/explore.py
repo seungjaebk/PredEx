@@ -42,31 +42,31 @@ from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 # ==============================================================================
 # NBH module imports
 # ==============================================================================
-from nbh.exploration_config import (
+from scripts.exploration_config import (
     DELTA_SCALE, CELL_SIZE, WAYPOINT_REACHED_TOLERANCE, WAYPOINT_STALE_STEPS,
     MAX_TARGET_DISTANCE, build_promotion_cfg, get_graph_update_mode,
     should_run_full_update, should_run_light_update
 )
-from nbh.graph_utils import CellManager, parse_debug_edge_samples
-from nbh.flow_planner import load_flow_model
-from nbh.high_level_planner import WaypointState
-from nbh.waypoint_utils import select_waypoint_cell
-from nbh.flow_viz_utils import (
+from scripts.graph_utils import CellManager, parse_debug_edge_samples
+from scripts.flow_planner import load_flow_model
+from scripts.high_level_planner import WaypointState
+from scripts.waypoint_utils import select_waypoint_cell
+from scripts.flow_viz_utils import (
     sample_multiple_trajectories, visualize_trajectory_distribution,
     visualize_cell_graph, select_best_trajectory
 )
-from nbh.flow_planner import (
+from scripts.flow_planner import (
     build_flow_input_tensor, sample_flow_delta, extract_local_patch, sample_trajectory_for_cell
 )
-from nbh.lama_utils import (
+from scripts.lama_utils import (
     get_pred_maputils_from_viz, get_lama_padding_transform, get_padded_obs_map, get_padded_gt_map
 )
-from nbh.frontier_utils import (
+from scripts.frontier_utils import (
     update_mission_status, is_locked_frontier_center_valid, reselect_frontier_from_frontier_region_centers,
     determine_local_planner
 )
-from nbh.exploration_config import get_options_dict_from_yml
-from nbh.viz_utils import compute_pad_offsets, should_save_graph_map, should_save_viz
+from scripts.exploration_config import get_options_dict_from_yml
+from scripts.viz_utils import compute_pad_offsets, should_save_graph_map, should_save_viz
 
 # ==============================================================================
 # Utility imports
@@ -266,6 +266,8 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         if mode == 'nbh':
             # Robot-centric cell manager: start_pose becomes centroid of cell (0, 0)
             # Cell indices can be negative (robot can move "backwards" from start)
+            # map_origin = (pd_size, pd_size) to account for the map padding
+            PD_SIZE = 500  # Padding size for raycast at boundary
             cell_manager = CellManager(
                 cell_size=CELL_SIZE_CONFIG,
                 start_pose=start_pose,
@@ -273,6 +275,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                 promotion_cfg=promotion_cfg,
                 connectivity_cfg=connectivity_cfg,
                 debug_cfg=debug_cfg,
+                map_origin=(PD_SIZE, PD_SIZE),
             )
             debug_edge_samples = parse_debug_edge_samples(
                 nbh_cfg.get("graph_debug_edge_samples")
@@ -299,8 +302,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         global_obs_dir = os.path.join(exp_dir, 'global_obs')
         run_viz_dir = os.path.join(exp_dir, 'run_viz')
         graph_map_dir = os.path.join(exp_dir, 'graph_map')
-        if nbh_cfg.get("graph_debug_los_viz", False):
-            los_viz_dir = os.path.join(exp_dir, 'los_debug')
+
         dir_paths = [global_obs_dir, run_viz_dir]
         if save_graph_map:
             dir_paths.append(graph_map_dir)
@@ -404,7 +406,8 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         
         # Gateway Locking & Waypoint Logic
         current_waypoint = None
-        locked_target_cell = None  # Store the cell object for visualization
+        locked_target_cell = None  # Store the cell object for visualization (high-level target)
+        locked_waypoint_cell = None  # Store the immediate next cell (waypoint) for reached detection
         locked_path_to_target = None  # Store risk path for graph-based distance
         locked_trajectory = None  # Store the selected flow trajectory (computed once per cell)
         locked_trajectory_samples = None  # Store all sampled trajectories for visualization
@@ -414,6 +417,19 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         # Stale Waypoint Detection - give up if stuck for too long
         waypoint_steps_counter = 0
         WAYPOINT_STALE_STEPS = 30  # Max steps per cell before marking stale
+        
+        # High-level Target Stalemate Detection - reselect if not making graph progress
+        prev_graph_distance_to_target = None
+        target_stale_steps = 0
+        TARGET_STALE_STEPS_THRESHOLD = 20  # Steps without graph distance decrease
+        
+        # Stale target blacklist - temporarily exclude targets that caused stalemate
+        stale_target_blacklist = {}  # {cell_index: step_when_blacklisted}
+        STALE_BLACKLIST_DURATION = 100  # Steps before target can be selected again
+        
+        # Recently reached cooldown - prevent oscillation between adjacent cells
+        recently_reached_cooldown = {}  # {cell_index: step_when_reached}
+        RECENTLY_REACHED_COOLDOWN = 10  # Steps before cell can be selected as target again
         
         # Maximum target distance - don't target centroids too far away
         MAX_TARGET_DISTANCE = 60.0  # pixels (~6m) - keeps targets local and achievable
@@ -663,10 +679,24 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             # Fallback to Euclidean if no path
                             graph_dist = np.linalg.norm(cur_pose - current_waypoint)
                         
-                        # Check if reached: within tolerance of immediate next waypoint
-                        dist_to_next_wp = np.linalg.norm(cur_pose - current_waypoint)
+                        # Check if reached: robot is WITHIN the waypoint cell (cell index match)
+                        # Use locked_waypoint_cell (immediate next cell), NOT locked_target_cell (high-level target)
+                        if locked_waypoint_cell is not None:
+                            waypoint_cell_idx = locked_waypoint_cell.index
+                            cur_cell_idx = cell_manager.get_cell_index(cur_pose)
+                            reached_waypoint = (cur_cell_idx == waypoint_cell_idx)
+                            # Debug: print when close to waypoint but cell indices don't match
+                            dist_to_wp = np.linalg.norm(cur_pose - current_waypoint)
+                            if dist_to_wp < cell_manager.cell_size and not reached_waypoint:
+                                print(f"[CELL DEBUG] Close but not reached! cur_pose={cur_pose}, "
+                                      f"waypoint={current_waypoint}, dist={dist_to_wp:.1f}px, "
+                                      f"cur_idx={cur_cell_idx}, wp_idx={waypoint_cell_idx}")
+                        else:
+                            # Fallback to distance if no locked waypoint cell
+                            dist_to_next_wp = np.linalg.norm(cur_pose - current_waypoint)
+                            reached_waypoint = (dist_to_next_wp <= cell_manager.cell_size * 0.5)
                         
-                        if dist_to_next_wp > WAYPOINT_REACHED_TOLERANCE:
+                        if not reached_waypoint:
                             # NOT reached yet - keep targeting locked waypoint
                             target_pos = current_waypoint
                             target_cell = locked_target_cell  # Use stored cell for visualization
@@ -680,16 +710,20 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                     locked_target_cell.visit_count += 5  # Penalize this cell
                                 # Clear waypoint to get a new target
                                 current_waypoint = None
+                                locked_waypoint_cell = None
                                 locked_target_cell = None
                                 locked_path_to_target = None
                                 locked_trajectory = None
                                 locked_trajectory_samples = None
                                 waypoint_steps_counter = 0
                         else:
-                            # Waypoint Reached! Clear only the waypoint; keep high-level target
-                            print(f"Waypoint Reached! (dist={dist_to_next_wp:.2f}, path_remaining={remaining_cells if 'remaining_cells' in dir() else '?'} cells)")
+                            # Waypoint Reached! Robot is within the target cell
+                            print(f"Waypoint Reached! (cell_idx={cur_cell_idx}, path_remaining={remaining_cells if 'remaining_cells' in dir() else '?'} cells)")
                             waypoint_reached_this_step = True
+                            # Add reached cell to cooldown to prevent immediate re-selection
+                            recently_reached_cooldown[cur_cell_idx] = t
                             current_waypoint = None
+                            locked_waypoint_cell = None
                             locked_trajectory = None
                             locked_trajectory_samples = None
                             waypoint_steps_counter = 0
@@ -722,23 +756,50 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                         f"(reason={target_unreachable_reason})"
                                     )
                         
-                        target_change_reasons = []
+                        # Stalemate detection: check if making progress toward target
+                        target_stale = False
+                        if target_cell is not None and path_to_target is not None and len(path_to_target) > 0:
+                            current_graph_distance = len(path_to_target)
+                            if prev_graph_distance_to_target is not None:
+                                if current_graph_distance >= prev_graph_distance_to_target:
+                                    # Not making progress
+                                    target_stale_steps += 1
+                                    if target_stale_steps >= TARGET_STALE_STEPS_THRESHOLD:
+                                        target_stale = True
+                                        # Add stale target to blacklist
+                                        if target_cell is not None:
+                                            stale_target_blacklist[target_cell.index] = step
+                                            if debug_cfg.get("graph_debug_targets"):
+                                                print(f"[HIGH-LEVEL] Target {target_cell.index} stale: blacklisted for {STALE_BLACKLIST_DURATION} steps")
+                                else:
+                                    # Making progress, reset counter
+                                    target_stale_steps = 0
+                            prev_graph_distance_to_target = current_graph_distance
+                        
+                        # Clean up expired blacklist entries
+                        expired_keys = [k for k, v in stale_target_blacklist.items() if t - v >= STALE_BLACKLIST_DURATION]
+                        for k in expired_keys:
+                            del stale_target_blacklist[k]
+                        
+                        # Determine reason for target reselection (simplified, no overlap)
+                        # Priority: none > reached > unreachable (includes blocked) > stale
+                        target_change_reason = None
                         if target_cell is None:
-                            target_change_reasons.append("none")
-                        elif target_cell.is_blocked:
-                            target_change_reasons.append("blocked")
-                        if target_cell is not None and cell_manager.current_cell is not None:
+                            target_change_reason = "none"
+                        elif target_cell is not None and cell_manager.current_cell is not None:
                             if target_cell.index == cell_manager.current_cell.index:
-                                target_change_reasons.append("reached")
-                        if target_unreachable:
-                            target_change_reasons.append("unreachable")
+                                target_change_reason = "reached"
+                        if target_change_reason is None and target_unreachable:
+                            # unreachable includes: blocked, node_missing, edge_removed
+                            target_change_reason = "unreachable"
+                        if target_change_reason is None and target_stale:
+                            target_change_reason = "stale"
 
-                        need_new_high_level_target = len(target_change_reasons) > 0
+                        need_new_high_level_target = target_change_reason is not None
                         
                         if need_new_high_level_target:
-                            reasons_str = ", ".join(target_change_reasons)
                             if debug_cfg.get("graph_debug_targets"):
-                                print(f"[HIGH-LEVEL] Reselecting target (reason: {reasons_str})")
+                                print(f"[HIGH-LEVEL] Reselecting target (reason: {target_change_reason})")
                             if (
                                 not did_full_update
                                 and should_run_full_update(
@@ -755,14 +816,27 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                     inflated_occ_grid=occ_grid_pyastar,
                                 )
                                 did_full_update = True
+                            # Expire old cooldown entries
+                            expired_cooldown = [k for k, v in recently_reached_cooldown.items() 
+                                                if t - v >= RECENTLY_REACHED_COOLDOWN]
+                            for k in expired_cooldown:
+                                del recently_reached_cooldown[k]
+                            
+                            # Combine stale blacklist and cooldown for exclusion
+                            exclude_from_target = set(stale_target_blacklist.keys()) | set(recently_reached_cooldown.keys())
+                            
                             # Find best ghost cell (highest uncertainty) that is REACHABLE from current cell
                             exploration_target = cell_manager.find_exploration_target(
                                 latest_pred_var_map if latest_pred_var_map is not None else np.zeros_like(mapper.obs_map),
-                                current_cell=cell_manager.current_cell  # Only consider reachable cells
+                                current_cell=cell_manager.current_cell,  # Only consider reachable cells
+                                exclude_cells=exclude_from_target  # Exclude stale + recently reached
                             )
                             
                             if exploration_target is not None:
                                 target_cell = exploration_target
+                                # Reset stalemate tracking for new target
+                                prev_graph_distance_to_target = None
+                                target_stale_steps = 0
                                 if debug_cfg.get("graph_debug_targets"):
                                     print(f"[HIGH-LEVEL] New exploration target: {target_cell.index}")
                                 
@@ -816,6 +890,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             
                             # Lock this new waypoint + path for graph-based distance
                             current_waypoint = target_pos
+                            locked_waypoint_cell = next_cell  # Store immediate waypoint for reached detection
                             locked_target_cell = target_cell  # Store high-level target for visualization
                             locked_path_to_target = path_to_target  # Store path for distance calculation
                             waypoint_steps_counter = 0
@@ -905,8 +980,26 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     
                     if USE_ASTAR_FOR_LOCAL and target_pos is not None:
                         # ========== A* LOCAL PLANNER (for debugging high-level) ==========
-                        # Use A* to plan from current pose to target cell center
+                        # Use A* to plan from current pose to target cell
+                        # If centroid is blocked, find nearest accessible point in cell
                         target_pose_int = tuple(target_pos.astype(int))
+
+                        # Create prediction-aware cost grid for NBH mode
+                        # Replace unknown regions with prediction values
+                        nbh_cost_grid = occ_grid_pyastar.copy()
+                        if unpadded_pred_mean is not None:
+                            obs_map = mapper.obs_map
+                            pred_map = unpadded_pred_mean
+                            # Where obs_map is unknown (0.5), use prediction instead
+                            unknown_mask = (obs_map == 0.5)
+                            # Align shapes if needed
+                            if pred_map.shape == obs_map.shape:
+                                # Predicted wall (> 0.7) = high cost, predicted free (< 0.3) = low cost
+                                pred_costs = np.ones_like(obs_map, dtype=np.float32)
+                                pred_costs[pred_map > 0.7] = np.inf  # Predicted wall = blocked
+                                pred_costs[pred_map <= 0.7] = 1.0 + pred_map[pred_map <= 0.7]  # Cost proportional to occupancy
+                                # Apply to unknown regions only
+                                nbh_cost_grid[unknown_mask] = pred_costs[unknown_mask]
 
                         if debug_cfg.get("graph_debug_local_astar"):
                             if not printed_local_astar_cfg:
@@ -929,10 +1022,10 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                     continue
                                 seen.add((r_i, c_i))
                                 if (
-                                    0 <= r_i < occ_grid_pyastar.shape[0]
-                                    and 0 <= c_i < occ_grid_pyastar.shape[1]
+                                    0 <= r_i < nbh_cost_grid.shape[0]
+                                    and 0 <= c_i < nbh_cost_grid.shape[1]
                                 ):
-                                    cost_val = occ_grid_pyastar[r_i, c_i]
+                                    cost_val = nbh_cost_grid[r_i, c_i]
                                     if np.isinf(cost_val):
                                         cost_val = "inf"
                                     else:
@@ -946,7 +1039,43 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                 f"{line_cost_samples}"
                             )
 
-                        astar_path = pyastar2d.astar_path(occ_grid_pyastar, tuple(cur_pose), target_pose_int, allow_diagonal=False)
+                        # If centroid is blocked, search for accessible alternative in cell
+                        if (0 <= target_pose_int[0] < nbh_cost_grid.shape[0] and 
+                            0 <= target_pose_int[1] < nbh_cost_grid.shape[1]):
+                            if np.isinf(nbh_cost_grid[target_pose_int[0], target_pose_int[1]]):
+                                # Centroid blocked - search nearby for accessible point
+                                cell_half = cell_manager.cell_size // 2
+                                found_alt = False
+                                for offset in range(1, cell_half + 1):
+                                    for dr in [-offset, 0, offset]:
+                                        for dc in [-offset, 0, offset]:
+                                            if dr == 0 and dc == 0:
+                                                continue
+                                            alt_r = target_pose_int[0] + dr
+                                            alt_c = target_pose_int[1] + dc
+                                            if (0 <= alt_r < nbh_cost_grid.shape[0] and 
+                                                0 <= alt_c < nbh_cost_grid.shape[1]):
+                                                if not np.isinf(nbh_cost_grid[alt_r, alt_c]):
+                                                    target_pose_int = (alt_r, alt_c)
+                                                    found_alt = True
+                                                    print(f"[A* LOCAL] Centroid blocked, using alt target: {target_pose_int}")
+                                                    break
+                                        if found_alt:
+                                            break
+                                    if found_alt:
+                                        break
+
+                        # Skip A* if already at target (pyastar2d returns None when start==goal)
+                        dist_to_astar_target = np.linalg.norm(np.array(cur_pose) - np.array(target_pose_int))
+                        if dist_to_astar_target < 3.0:  # Already at target (within 3 pixels)
+                            print(f"[A* LOCAL] Already at target! dist={dist_to_astar_target:.1f}px")
+                            astar_path = None  # Skip A*, signal that we've arrived
+                            next_pose = cur_pose.copy()
+                            delta = np.zeros(2, dtype=np.float32)
+                            delta_pixels = np.zeros(2, dtype=int)
+                            path = None
+                        else:
+                            astar_path = pyastar2d.astar_path(nbh_cost_grid, tuple(cur_pose), target_pose_int, allow_diagonal=False)
                         
                         if astar_path is not None and len(astar_path) > 1:
                             # Use pseudo trajectory controller to get next pose
@@ -964,8 +1093,28 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             if debug_cfg.get("graph_debug_local_astar"):
                                 print(f"[A* DEBUG] astar_path_head={astar_path[:8].tolist()}")
                         else:
-                            # A* failed - target unreachable
-                            print(f"[A* LOCAL] ⚠️ No path to target {target_pose_int}! Staying in place.")
+                            # A* failed - target unreachable - add debug info
+                            target_cost = "out_of_bounds"
+                            if (0 <= target_pose_int[0] < nbh_cost_grid.shape[0] and 
+                                0 <= target_pose_int[1] < nbh_cost_grid.shape[1]):
+                                tc = nbh_cost_grid[target_pose_int[0], target_pose_int[1]]
+                                target_cost = "inf" if np.isinf(tc) else f"{tc:.2f}"
+                            
+                            # Sample costs along line from current to target
+                            rr = np.linspace(cur_pose[0], target_pose_int[0], num=10)
+                            cc = np.linspace(cur_pose[1], target_pose_int[1], num=10)
+                            inf_count = 0
+                            first_block = None
+                            for r_val, c_val in zip(rr, cc):
+                                r_i, c_i = int(r_val), int(c_val)
+                                if 0 <= r_i < nbh_cost_grid.shape[0] and 0 <= c_i < nbh_cost_grid.shape[1]:
+                                    if np.isinf(nbh_cost_grid[r_i, c_i]):
+                                        inf_count += 1
+                                        if first_block is None:
+                                            first_block = (r_i, c_i)
+                            
+                            print(f"[A* LOCAL] ⚠️ No path to target! Staying in place.")
+                            print(f"[A* DEBUG] target_cost={target_cost}, blocked_cells={inf_count}/10, first_block={first_block}")
                             next_pose = cur_pose.copy()
                             delta = np.zeros(2, dtype=np.float32)
                             delta_pixels = np.zeros(2, dtype=int)
@@ -1197,11 +1346,30 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     colors_ = ["#FFFFFF", "#D9D9D9", "#000000"]
                     cmap = ListedColormap(colors_)
                     obs_viz_map = latest_padded_obs_map if latest_padded_obs_map is not None else mapper.obs_map
-                    ax_obs.imshow(obs_viz_map[pd_size:-pd_size,pd_size:-pd_size], cmap = cmap)#, **map_kwargs)
+                    
+                    # For NBH mode, show detailed cell graph instead of observed map
+                    if mode == 'nbh' and cell_manager is not None:
+                        ax_obs.clear()
+                        cell_graph_obs_map = (
+                            latest_padded_obs_map
+                            if latest_padded_obs_map is not None
+                            else get_padded_obs_map(mapper.obs_map)
+                        )
+                        visualize_cell_graph(
+                            ax_obs, cell_manager, cell_graph_obs_map, mean_map,
+                            current_pose=cur_pose, target_cell=target_cell, 
+                            path_to_target=path_to_target, pd_size=pd_size,
+                            show_cell_boundaries=True, show_edges=True, show_scores=True,
+                            display_offset=np.array([-pd_size, -pd_size], dtype=float),
+                            astar_path=path if 'path' in dir() else None,
+                        )
+                        ax_obs.set_title('Detailed Cell Graph (with Scores)')
+                    else:
+                        ax_obs.imshow(obs_viz_map[pd_size:-pd_size,pd_size:-pd_size], cmap = cmap)
 
                     
-
-                    if pose_list is not None:
+                    # Skip additional ax_obs drawing for NBH mode (cell graph already drawn)
+                    if mode != 'nbh' and pose_list is not None:
                         ax_obs.plot(pose_list[:, 1]-obs_offset_c, pose_list[:, 0]-obs_offset_r, c='#eb4205', alpha=1.0)
                     if mode not in ['upen', 'hector', 'hectoraug'] and locked_frontier_center is not None: # UPEN and Hector do not have locked frontiers
                         ax_obs.scatter(locked_frontier_center[1]-obs_offset_c, locked_frontier_center[0]-obs_offset_r, c='#eb4205', s=10)
@@ -1225,12 +1393,11 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                                 ax_obs.imshow(flooded_ind_colors_alpha[pd_size+pad_h1:-(pd_size+pad_h2),pd_size+pad_w1:-(pd_size+pad_w2)])
 
                     if mode == 'nbh':
-                        # Visualize Gateway and Target Cell
+                        # Visualize Gateway and Target Cell on GT Map only (cell graph shows it on ax_obs)
                         if 'target_cell' in locals() and target_cell is not None:
-                            # Target Cell Center (Blue Circle)
+                            # Target Cell Center (Blue Circle) - on GT map only
                             tc_r, tc_c = target_cell.center
                             ax_gt.scatter(tc_c - pd_size, tc_r - pd_size, c='blue', s=30, marker='o', label='Cell Center')
-                            ax_obs.scatter(tc_c - obs_offset_c, tc_r - obs_offset_r, c='blue', s=30, marker='o')
 
                     # Visualize Flow Vector
                     if mode == 'nbh' and 'delta_pixels' in locals():
@@ -1256,18 +1423,13 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             # Occluded Mask = Range Mask AND NOT Visible in Range
                             occluded_mask = range_mask & (~visible_in_range)
                             
-                            # Get indices for plotting
-                            vis_rows, vis_cols = np.where(visible_in_range)
-                            occ_rows, occ_cols = np.where(occluded_mask)
-                            
-                            # Plot Visible within range (Cyan)
-                            ax_obs.scatter(vis_cols - obs_offset_c, vis_rows - obs_offset_r, c='cyan', s=1, alpha=0.05, label='Visible Area')
-                            
-                            # Plot Occluded (Orange) - within range but blocked
-                            ax_obs.scatter(occ_cols - obs_offset_c, occ_rows - obs_offset_r, c='orange', s=1, alpha=0.05, label='Occluded Area')
+                            # Store masks for cell graph visualization
+                            lidar_visible_mask = visible_in_range
+                            lidar_occluded_mask = occluded_mask
                             
                         except Exception:
-                            pass
+                            lidar_visible_mask = None
+                            lidar_occluded_mask = None
 
                         if not USE_ASTAR_FOR_LOCAL:
                             # Scale up for visibility
@@ -1313,7 +1475,9 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                             ]
                             ax_obs.legend(handles=legend_elements, loc='upper right', fontsize='small')
                         
-                    ax_obs.set_title('Observed Map')
+                    # Set title (NBH already set title to 'Detailed Cell Graph' above)
+                    if mode != 'nbh':
+                        ax_obs.set_title('Observed Map')
 
                     if pred_maputils is not None and mean_map is not None:
                         white = "#FFFFFF"
@@ -1411,9 +1575,13 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                         visualize_cell_graph(
                             ax_cell_graph, cell_manager, cell_graph_obs_map, mean_map,
                             current_pose=cur_pose, target_cell=target_cell, 
-                            path_to_target=path_to_target, pd_size=0,
+                            path_to_target=path_to_target, pd_size=pd_size,
                             show_cell_boundaries=True,
-                            display_offset=cell_graph_offset,
+                            display_offset=np.array([-pd_size, -pd_size], dtype=float),
+                            astar_path=path if 'path' in dir() else None,
+                            lidar_visible_mask=lidar_visible_mask if 'lidar_visible_mask' in dir() else None,
+                            lidar_occluded_mask=lidar_occluded_mask if 'lidar_occluded_mask' in dir() else None,
+                            map_bounds=(mapper.obs_map.shape[0] - 2*pd_size, mapper.obs_map.shape[1] - 2*pd_size),
                         )
 
                     plt.tight_layout()
@@ -1433,21 +1601,24 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
                     if mode == 'nbh' and cell_manager is not None and show_plt and save_graph_map and should_save_fig:
                         fig_graph, ax_graph = plt.subplots(1, 1, figsize=(10, 10))
                         graph_gt_map = padded_gt_map if padded_gt_map is not None else get_padded_gt_map(mapper.gt_map)
-                        ax_graph.imshow(1-graph_gt_map, cmap='gray', vmin=0, vmax=1)
+                        # Crop the GT map by pd_size to match cell coordinate system
+                        h, w = graph_gt_map.shape
+                        cropped_gt_map = graph_gt_map[pd_size:h-pd_size, pd_size:w-pd_size]
+                        ax_graph.imshow(1-cropped_gt_map, cmap='gray', vmin=0, vmax=1)
                         visualize_cell_graph(
                             ax_graph, cell_manager, graph_gt_map, mean_map,
                             current_pose=cur_pose, target_cell=target_cell,
-                            path_to_target=path_to_target, pd_size=0,
+                            path_to_target=path_to_target, pd_size=pd_size,
                             overlay_mode=True,
                             show_scores=True,
                             start_cell=None,
                             astar_path=astar_path if 'astar_path' in locals() else None,
                             show_cell_boundaries=True,
-                            display_offset=cell_graph_offset,
+                            display_offset=np.array([-pd_size, -pd_size], dtype=float),
                         )
                         ax_graph.scatter(
-                            cur_pose[1] + cell_graph_offset[1],
-                            cur_pose[0] + cell_graph_offset[0],
+                            cur_pose[1] - pd_size,
+                            cur_pose[0] - pd_size,
                             c='lime',
                             s=30,
                             marker='*',

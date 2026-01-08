@@ -46,14 +46,16 @@ def pick_farthest_los_cell(cur_pose: np.ndarray, path_cells, obs_map: np.ndarray
 
 
 def select_waypoint_cell(cur_pose: np.ndarray, path_cells, obs_map: np.ndarray):
-    """Choose the farthest LOS cell, falling back to the next path cell."""
+    """Choose the next cell in path (one step at a time for safer navigation).
+    
+    Note: Previously used farthest LOS cell, but this caused issues when LOS
+    passed through unknown regions (allowed by obs_map==0.5) while A* couldn't
+    find a path through those same regions (blocked by unknown_as_occ).
+    """
     if not path_cells:
         return None
 
-    los_cell = pick_farthest_los_cell(cur_pose, path_cells, obs_map)
-    if los_cell is not None and los_cell is not path_cells[0]:
-        return los_cell
-
+    # Simply return the next cell in path (one step at a time)
     if len(path_cells) > 1:
         return path_cells[1]
 

@@ -360,7 +360,8 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
                           current_pose=None, target_cell=None, 
                           path_to_target=None, show_edges=True, pd_size=500,
                           overlay_mode=False, start_cell=None, astar_path=None, show_scores=False,
-                          show_cell_boundaries=False, display_offset=None):
+                          show_cell_boundaries=False, display_offset=None,
+                          lidar_visible_mask=None, lidar_occluded_mask=None, map_bounds=None):
     """
     Visualize the cell graph with Real (observed) and Ghost (hallucinated) nodes.
     
@@ -380,6 +381,9 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
         show_scores: whether to show node scores as text labels
         show_cell_boundaries: draw dashed cell boundaries
         display_offset: (row, col) offset to apply when plotting cell centers
+        lidar_visible_mask: boolean mask for visible area (cyan)
+        lidar_occluded_mask: boolean mask for occluded area (orange)
+        map_bounds: (height, width) of unpadded map for clipping LiDAR viz
     """
     if display_offset is None:
         display_offset = np.array([-pd_size, -pd_size], dtype=float)
@@ -391,6 +395,33 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
         h, w = obs_map.shape
         display_obs = obs_map[pd_size:h-pd_size, pd_size:w-pd_size] if pd_size > 0 else obs_map
         ax.imshow(1 - display_obs, cmap='gray', vmin=0, vmax=1)  # Invert!
+    
+    # Draw LiDAR overlay if masks provided (cyan=visible, orange=occluded)
+    if lidar_visible_mask is not None or lidar_occluded_mask is not None:
+        # Get display map bounds
+        disp_h = map_bounds[0] if map_bounds else (obs_map.shape[0] - 2*pd_size if obs_map is not None else 500)
+        disp_w = map_bounds[1] if map_bounds else (obs_map.shape[1] - 2*pd_size if obs_map is not None else 500)
+        
+        if lidar_visible_mask is not None:
+            # Clip mask to display bounds (padded coords → display coords)
+            vis_rows, vis_cols = np.where(lidar_visible_mask)
+            vis_disp_r = vis_rows - pd_size
+            vis_disp_c = vis_cols - pd_size
+            # Filter to map bounds
+            valid_vis = (vis_disp_r >= 0) & (vis_disp_r < disp_h) & (vis_disp_c >= 0) & (vis_disp_c < disp_w)
+            if np.any(valid_vis):
+                ax.scatter(vis_disp_c[valid_vis], vis_disp_r[valid_vis], 
+                          c='cyan', s=1, alpha=0.03, zorder=1)
+        
+        if lidar_occluded_mask is not None:
+            occ_rows, occ_cols = np.where(lidar_occluded_mask)
+            occ_disp_r = occ_rows - pd_size
+            occ_disp_c = occ_cols - pd_size
+            # Filter to map bounds
+            valid_occ = (occ_disp_r >= 0) & (occ_disp_r < disp_h) & (occ_disp_c >= 0) & (occ_disp_c < disp_w)
+            if np.any(valid_occ):
+                ax.scatter(occ_disp_c[valid_occ], occ_disp_r[valid_occ],
+                          c='orange', s=1, alpha=0.03, zorder=1)
     
     # Collect nodes by type
     real_nodes = []
@@ -433,13 +464,20 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
             ax.add_patch(rect)
     
     # Draw edges first (so nodes appear on top)
+    # Discrete color palette: black (RR safe), green/orange/red (risk levels)
+    def get_edge_color(cost, is_ghost):
+        """Map edge cost to discrete color: safe=green, moderate=orange, high=red."""
+        if not is_ghost:
+            return 'black'  # RR edges always black (safe, observed)
+        # Ghost edges: green < 0.1, orange 0.1-0.3, red > 0.3
+        if cost < 0.1:
+            return '#00AA00'  # Green - safe
+        elif cost < 0.3:
+            return '#FF8800'  # Orange - moderate risk
+        else:
+            return '#DD0000'  # Red - high risk
+    
     if show_edges:
-        real_edge_lines = []
-        real_edge_costs = []
-        ghost_edge_lines = []
-        ghost_edge_costs = []
-        cmap = plt.get_cmap("magma")
-        
         for idx, cell in cell_manager.cells.items():
             if cell.is_blocked:
                 continue
@@ -452,37 +490,19 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
                 n_center = neighbor.center + display_offset
                 if n_center[0] < 0 or n_center[1] < 0:
                     continue
-                # Draw edge (use (col, row) for matplotlib)
-                edge = [center[::-1], n_center[::-1]]
                 
                 edge_key = tuple(sorted([cell.index, neighbor.index]))
                 edge_cost = cell_manager.edge_costs.get(edge_key, 0.0)
-                if cell.is_ghost or neighbor.is_ghost:
-                    ghost_edge_lines.append(edge)
-                    ghost_edge_costs.append(edge_cost)
-                else:
-                    real_edge_lines.append(edge)
-                    real_edge_costs.append(edge_cost)
-        
-        if real_edge_lines:
-            norm_vals = normalize_edge_risks(np.array(real_edge_costs, dtype=float))
-            lc = LineCollection(
-                real_edge_lines,
-                colors=cmap(norm_vals),
-                alpha=0.7,
-                linewidths=1.1,
-            )
-            ax.add_collection(lc)
-        if ghost_edge_lines:
-            norm_vals = normalize_edge_risks(np.array(ghost_edge_costs, dtype=float))
-            lc = LineCollection(
-                ghost_edge_lines,
-                colors=cmap(norm_vals),
-                alpha=0.6,
-                linewidths=1.0,
-                linestyles='dashed',
-            )
-            ax.add_collection(lc)
+                is_ghost = cell.is_ghost or neighbor.is_ghost
+                color = get_edge_color(edge_cost, is_ghost)
+                linestyle = '--' if is_ghost else '-'
+                alpha = 0.6 if is_ghost else 0.7
+                linewidth = 0.8 if is_ghost else 1.0
+                
+                # Draw edge (col, row for matplotlib)
+                ax.plot([center[1], n_center[1]], [center[0], n_center[0]],
+                       color=color, linestyle=linestyle, alpha=alpha, 
+                       linewidth=linewidth, zorder=3)
     
     # Draw nodes (smaller icons)
     if real_nodes:
@@ -515,8 +535,9 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
         cur_cell = cell_manager.get_cell(cur_cell_idx)
         if cur_cell is not None:
             center = cur_cell.center + display_offset
-            ax.scatter([center[1]], [center[0]], c='red', s=80, marker='D',
-                       zorder=10, label='Current Cell', edgecolors='black', linewidths=0.5)
+            ax.scatter([center[1]], [center[0]], marker='D', s=120,
+                       facecolors='none', edgecolors='red', linewidths=2.0,
+                       zorder=10, label='Current Cell')
     
     # Highlight target cell (diamond shape, transparent inner, lime border)
     if target_cell is not None:
@@ -532,20 +553,37 @@ def visualize_cell_graph(ax, cell_manager, obs_map=None, pred_mean_map=None,
                    facecolors='none', edgecolors='red', linewidths=2.0,
                    zorder=10, label='Start Cell')
     
-    # Highlight path from current cell to target (magenta dashed line)
+    # Highlight path from current cell to target (light rectangles around edges)
     if path_to_target is not None and len(path_to_target) > 1:
-        # Draw thick magenta dashed path line connecting cell centers
-        path_centers = np.array([c.center + display_offset for c in path_to_target])
-        ax.plot(path_centers[:, 1], path_centers[:, 0], 
-               color='#FF00FF', linestyle='--', linewidth=2.5, 
-               alpha=0.9, label=get_graph_path_label(), zorder=8)
+        cell_size = cell_manager.cell_size
+        for i in range(len(path_to_target) - 1):
+            c1 = path_to_target[i].center + display_offset
+            c2 = path_to_target[i + 1].center + display_offset
+            # Create rectangle around the edge
+            min_r = min(c1[0], c2[0]) - cell_size * 0.3
+            max_r = max(c1[0], c2[0]) + cell_size * 0.3
+            min_c = min(c1[1], c2[1]) - cell_size * 0.3
+            max_c = max(c1[1], c2[1]) + cell_size * 0.3
+            width = max_c - min_c
+            height = max_r - min_r
+            rect = mpatches.Rectangle(
+                (min_c, min_r), width, height,
+                fill=True, facecolor='#FF00FF', alpha=0.15,
+                edgecolor='#FF00FF', linewidth=1.5, linestyle='-',
+                zorder=6
+            )
+            ax.add_patch(rect)
+        # Add label for legend
+        ax.plot([], [], color='#FF00FF', linewidth=3, alpha=0.5, 
+               label=get_graph_path_label())
     
-    # Highlight A* local path (red solid line)
+    # Highlight A* local path (red dotted line)
     if astar_path is not None and len(astar_path) > 1:
-        # A* path is in (row, col) format, convert to display coordinates
-        astar_display = astar_path + display_offset
+        # A* path is in PADDED (row, col) format - need to subtract pd_size, not add display_offset
+        # display_offset is already -pd_size, so this should work
+        astar_display = astar_path - pd_size  # Convert from padded to display coords
         ax.plot(astar_display[:, 1], astar_display[:, 0],
-               'r-', linewidth=2.0, alpha=0.8, label='A* Path', zorder=9)
+               'r:', linewidth=2.5, alpha=0.9, label='A* Path', zorder=9)
     
     # Show node scores as text labels (for debugging)
     if show_scores:

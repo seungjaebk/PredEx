@@ -32,8 +32,8 @@ mission_time: 1000
 local_planner: 'astar'  # Options: 'astar', 'flow'
 
 # Cell size in pixels (1 cell = cell_size/10 meters at 10px/m)
-# 25px = 2.5m, 20px = 2.0m, 30px = 3.0m
-cell_size: 25
+
+cell_size: 20
 
 nbh:
   # Ghost creation / promotion
@@ -48,7 +48,7 @@ nbh:
   # Connectivity / collision
   graph_unknown_as_occ: true           # unknown treated as occupied in RR mini-A*
   graph_pred_wall_threshold: 0.7       # legacy predicted-wall cutoff
-  graph_pred_hard_wall_threshold: 0.95 # ghost edge hard-block threshold
+  graph_pred_hard_wall_threshold: 0.95 # ghost edge hard-block threshold (for predicted walls)
   graph_mini_astar_ttl_steps: 10       # mini-A* cache TTL (steps)
 
   # Edge risk
@@ -80,7 +80,6 @@ nbh:
   graph_debug_risk_stats: true          # log graph stats, p_occ, edge cost, edge strip maxima
   graph_debug_propagation_stats: false  # log diffusion value stats
   graph_debug_local_astar: false        # log local A* inputs and line cost samples
-  graph_debug_los_viz: true             # save LOS debug plots for edges in graph_debug_edge_samples
 
   # Visualization
   viz_save_every_steps: 10
