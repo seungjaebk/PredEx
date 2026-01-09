@@ -4,7 +4,7 @@ NBH (Next Best Hallucination) Package
 Hierarchical robot exploration using ghost cells and flow matching.
 
 Modules:
-- exploration_config: Constants and configuration loading
+- config_utils: Configuration loading utilities
 - graph_utils: Cell graph + Ghost cells (CellNode, CellManager)
 - high_level_planner: Waypoint management and target selection
 - flow_planner: Flow matching model inference
@@ -15,22 +15,17 @@ Modules:
 - explore: Main entry point
 
 Usage:
-    from nbh.exploration_config import DELTA_SCALE, CELL_SIZE
-    from nbh.graph_utils import CellManager
-    from nbh.flow_planner import load_flow_model
+    from scripts.config_utils import get_options_dict_from_yml, build_promotion_cfg
+    from scripts.graph_utils import CellManager
+    from scripts.flow_planner import load_flow_model
 """
 
-# Only expose config constants at package level (minimal dependencies)
-from .exploration_config import (
-    DELTA_SCALE,
-    CELL_SIZE,
-    WAYPOINT_REACHED_TOLERANCE,
-    WAYPOINT_STALE_STEPS,
-    MAX_TARGET_DISTANCE,
-    MAX_GHOST_DISTANCE,
-    MAX_VAR_THRESHOLD,
-    FLOW_CROP_RADIUS,
-    FLOW_NUM_STEPS,
-    TRAJECTORY_NUM_SAMPLES,
-    GOAL_PERTURB_STD,
+# Expose config utilities at package level
+from .config_utils import (
+    get_options_dict_from_yml,
+    build_promotion_cfg,
+    get_graph_update_mode,
+    should_run_full_update,
+    should_run_light_update,
+    get_flow_config,
 )

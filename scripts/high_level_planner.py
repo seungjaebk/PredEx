@@ -9,12 +9,6 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Any
 
-from .exploration_config import (
-    CELL_SIZE, 
-    WAYPOINT_REACHED_TOLERANCE, 
-    WAYPOINT_STALE_STEPS
-)
-
 
 @dataclass
 class WaypointState:
@@ -44,8 +38,8 @@ def check_waypoint_status(
     cur_pose: np.ndarray,
     waypoint_state: WaypointState,
     cell_manager,
-    tolerance: float = WAYPOINT_REACHED_TOLERANCE,
-    max_steps: int = WAYPOINT_STALE_STEPS
+    tolerance: float = 1.0,
+    max_steps: int = 30
 ) -> Tuple[str, Optional[np.ndarray]]:
     """
     Check if current waypoint is reached or stale.
@@ -74,7 +68,7 @@ def check_waypoint_status(
                 if cell.index == cell_manager.current_cell.index:
                     remaining_cells = len(waypoint_state.locked_path_to_target) - i - 1
                     break
-        graph_dist = remaining_cells * CELL_SIZE
+        graph_dist = remaining_cells * cell_manager.cell_size
     else:
         # Fallback to Euclidean only if no path info
         graph_dist = np.linalg.norm(cur_pose - waypoint_state.current_waypoint)
@@ -174,8 +168,9 @@ def lock_new_waypoint(
     
     # Print info
     path_cells = len(path_to_target) if path_to_target else 1
-    graph_distance = path_cells * CELL_SIZE
-    print(f"New Waypoint Locked: Cell {next_cell.index}, path={path_cells} cells, dist={graph_distance:.1f}px")
+    cell_size = next_cell.center[0] - (next_cell.index[0] + 0.5) if hasattr(next_cell, 'center') else 20
+    # Approximate cell_size from cell center if available
+    print(f"New Waypoint Locked: Cell {next_cell.index}, path={path_cells} cells")
 
 
 def compute_goal_vector(cur_pose: np.ndarray, target_pos: np.ndarray) -> np.ndarray:

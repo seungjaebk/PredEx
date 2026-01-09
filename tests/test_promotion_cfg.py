@@ -1,4 +1,4 @@
-from nbh.exploration_config import build_promotion_cfg
+from scripts.config_utils import build_promotion_cfg
 
 
 def test_build_promotion_cfg_includes_grid_policy():

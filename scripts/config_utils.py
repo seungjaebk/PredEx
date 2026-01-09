@@ -1,50 +1,14 @@
 """
-Exploration Configuration Module
+Configuration Utilities Module
 
-Constants and configuration loading for the graph-flow exploration system.
+Helper functions for loading and processing configuration from YAML files.
 """
 
 import os
 
-# ============================================================================
-# NORMALIZATION CONSTANTS (must match training)
-# ============================================================================
-DELTA_SCALE = 10.0  # Scale factor for flow model output
-
-# ============================================================================
-# GRAPH/CELL CONSTANTS
-# ============================================================================
-CELL_SIZE = 25  # Pixels per cell (2.5m in real world at 10px/m)
-
-# ============================================================================
-# WAYPOINT NAVIGATION CONSTANTS
-# ============================================================================
-WAYPOINT_REACHED_TOLERANCE = 1.0  # Pixels - distance to consider waypoint reached
-WAYPOINT_STALE_STEPS = 30  # Max steps per cell before marking stale
-MAX_TARGET_DISTANCE = 60.0  # Pixels (~6m) - max distance for target selection
-
-# ============================================================================
-# GHOST CELL CONSTANTS
-# ============================================================================
-MAX_GHOST_DISTANCE = 3  # Max cells away from real cells
-MAX_VAR_THRESHOLD = 0.1  # Minimum variance to create ghost cell
-
-# ============================================================================
-# FLOW MODEL CONSTANTS
-# ============================================================================
-FLOW_CROP_RADIUS = 64  # Half of 128x128 patch
-FLOW_NUM_STEPS = 10  # ODE integration steps
-TRAJECTORY_NUM_SAMPLES = 50  # Number of trajectory samples
-GOAL_PERTURB_STD = 0.5  # Radians (~30°) for trajectory diversity
-
-# ============================================================================
-# GRAPH UPDATE MODE CONSTANTS
-# ============================================================================
-GRAPH_UPDATE_MODE_DEFAULT = "target_change"
-GRAPH_UPDATE_MODES = ("full", "target_change", "light_only")
-
 
 def _get_cfg_value(cfg, key, default):
+    """Get value from config object (dict or OmegaConf)."""
     if cfg is None:
         return default
     if isinstance(cfg, dict):
@@ -56,6 +20,7 @@ def _get_cfg_value(cfg, key, default):
 
 
 def build_promotion_cfg(nbh_cfg):
+    """Build promotion config dict from NBH config section."""
     return {
         "graph_grid_policy": _get_cfg_value(nbh_cfg, "graph_grid_policy", "full_map"),
         "graph_max_ghost_distance": _get_cfg_value(nbh_cfg, "graph_max_ghost_distance", 2),
@@ -71,7 +36,13 @@ def build_promotion_cfg(nbh_cfg):
     }
 
 
+# Graph update mode constants
+GRAPH_UPDATE_MODE_DEFAULT = "target_change"
+GRAPH_UPDATE_MODES = ("full", "target_change", "light_only")
+
+
 def get_graph_update_mode(nbh_cfg):
+    """Get graph update mode from NBH config."""
     mode = _get_cfg_value(nbh_cfg, "graph_update_mode", GRAPH_UPDATE_MODE_DEFAULT)
     if mode is None:
         mode = GRAPH_UPDATE_MODE_DEFAULT
@@ -81,6 +52,7 @@ def get_graph_update_mode(nbh_cfg):
 
 
 def should_run_full_update(mode, has_graph, need_new_target):
+    """Determine if full graph update should run based on mode and state."""
     if mode == "full":
         return True
     if mode == "target_change":
@@ -91,6 +63,7 @@ def should_run_full_update(mode, has_graph, need_new_target):
 
 
 def should_run_light_update(mode):
+    """Determine if light graph update should run based on mode."""
     if mode not in GRAPH_UPDATE_MODES:
         raise ValueError(f"Invalid graph_update_mode: {mode}")
     return mode in ("target_change", "light_only")
@@ -101,10 +74,10 @@ def get_options_dict_from_yml(config_name):
     from omegaconf import OmegaConf
     import hydra
     
-    # Get NBH root directory (parent of nbh/ module)
-    nbh_module_dir = os.path.dirname(os.path.abspath(__file__))
-    nbh_root = os.path.dirname(nbh_module_dir)
-    hydra_config_dir_path = os.path.join(nbh_root, 'configs')
+    # Get project root directory (parent of scripts/ module)
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(scripts_dir)
+    hydra_config_dir_path = os.path.join(project_root, 'configs')
     
     print(f"Loading config from: {hydra_config_dir_path}")
     with hydra.initialize_config_dir(config_dir=hydra_config_dir_path, version_base=None):
@@ -125,22 +98,53 @@ def get_options_dict_from_yml(config_name):
     return options
 
 
-def get_flow_config(flow_runtime=None):
-    """Get flow planner configuration from runtime or defaults."""
+def get_flow_config(options=None):
+    """
+    Get flow planner configuration from options.
+    
+    Reads values from YAML config (options.flow section) with defaults.
+    """
+    # Defaults (fallback if not in YAML)
+    defaults = {
+        'delta_scale': 10.0,
+        'num_steps': 10,
+        'crop_radius': 64,
+        'num_samples': 50,
+        'goal_perturb_std': 0.5,
+    }
+    
     config = {
         'model': None,
         'device': None,
-        'num_steps': FLOW_NUM_STEPS,
-        'crop_radius': FLOW_CROP_RADIUS,
-        'delta_scale': DELTA_SCALE,
-        'num_samples': TRAJECTORY_NUM_SAMPLES,
-        'goal_perturb_std': GOAL_PERTURB_STD,
     }
     
-    if flow_runtime is not None:
-        config['model'] = flow_runtime.get('model')
-        config['device'] = flow_runtime.get('device')
-        config['num_steps'] = flow_runtime.get('num_steps', FLOW_NUM_STEPS)
-        config['crop_radius'] = flow_runtime.get('crop_radius', FLOW_CROP_RADIUS)
+    # Get flow section from options
+    flow_cfg = None
+    if options is not None:
+        flow_cfg = _get_cfg_value(options, 'flow', None)
+    
+    for key, default_val in defaults.items():
+        config[key] = _get_cfg_value(flow_cfg, key, default_val)
     
     return config
+
+
+# ============================================================================
+# COORDINATE CONVERSION UTILITIES
+# ============================================================================
+# Maps are processed with: 2x reduction (block_reduce) then 500px padding
+# Original coords -> Processed coords: [row/2 + 500, col/2 + 500]
+# Processed coords -> Original coords: [(row - 500) * 2, (col - 500) * 2]
+
+MAP_BLOCK_SIZE = 2
+MAP_PADDING = 500
+
+
+def original_to_processed_coords(row, col):
+    """Convert original map coordinates to processed (2x reduced + padded) coordinates."""
+    return (row // MAP_BLOCK_SIZE + MAP_PADDING, col // MAP_BLOCK_SIZE + MAP_PADDING)
+
+
+def processed_to_original_coords(row, col):
+    """Convert processed coordinates back to original map coordinates."""
+    return ((row - MAP_PADDING) * MAP_BLOCK_SIZE, (col - MAP_PADDING) * MAP_BLOCK_SIZE)

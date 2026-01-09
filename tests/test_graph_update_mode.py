@@ -1,6 +1,6 @@
 import pytest
 
-from nbh.exploration_config import (
+from scripts.config_utils import (
     get_graph_update_mode,
     should_run_full_update,
     should_run_light_update,

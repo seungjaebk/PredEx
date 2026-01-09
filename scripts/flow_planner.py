@@ -10,7 +10,11 @@ import torch
 import os
 from contextlib import contextmanager
 
-from .exploration_config import DELTA_SCALE, FLOW_NUM_STEPS, TRAJECTORY_NUM_SAMPLES, GOAL_PERTURB_STD
+# Default values (can be overridden via YAML config)
+DELTA_SCALE = 10.0
+FLOW_NUM_STEPS = 10
+TRAJECTORY_NUM_SAMPLES = 50
+GOAL_PERTURB_STD = 0.5
 
 
 @contextmanager

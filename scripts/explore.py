@@ -42,10 +42,10 @@ from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 # ==============================================================================
 # NBH module imports
 # ==============================================================================
-from scripts.exploration_config import (
-    DELTA_SCALE, CELL_SIZE, WAYPOINT_REACHED_TOLERANCE, WAYPOINT_STALE_STEPS,
-    MAX_TARGET_DISTANCE, build_promotion_cfg, get_graph_update_mode,
-    should_run_full_update, should_run_light_update
+from scripts.config_utils import (
+    build_promotion_cfg, get_graph_update_mode,
+    should_run_full_update, should_run_light_update,
+    get_options_dict_from_yml
 )
 from scripts.graph_utils import CellManager, parse_debug_edge_samples
 from scripts.flow_planner import load_flow_model
@@ -65,7 +65,6 @@ from scripts.frontier_utils import (
     update_mission_status, is_locked_frontier_center_valid, reselect_frontier_from_frontier_region_centers,
     determine_local_planner
 )
-from scripts.exploration_config import get_options_dict_from_yml
 from scripts.viz_utils import compute_pad_offsets, should_save_graph_map, should_save_viz
 
 # ==============================================================================
@@ -216,6 +215,11 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
         # 'flow': Use Flow model for local planning (what we're developing)
         USE_ASTAR_FOR_LOCAL = (collect_opts.local_planner == 'astar')
         CELL_SIZE_CONFIG = collect_opts.cell_size  # From yaml/CLI
+        
+        # Flow config from YAML
+        flow_cfg = getattr(collect_opts, "flow", {})
+        DELTA_SCALE = flow_cfg.get("delta_scale", 10.0) if flow_cfg else 10.0
+        
         nbh_cfg = getattr(collect_opts, "nbh", {})
 
         promotion_cfg = build_promotion_cfg(nbh_cfg)
@@ -283,7 +287,7 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
             if debug_edge_samples:
                 cell_manager.debug_edge_samples = debug_edge_samples
             print(f"Initialized NBH Cell Manager (Cell Size: {CELL_SIZE_CONFIG}px = {CELL_SIZE_CONFIG/10}m, Origin: {start_pose})")
-            
+        
         if mode != 'upen':
             planner_mode = mode
             if mode == 'nbh':
@@ -926,9 +930,9 @@ def run_exploration_for_map(occ_map, exp_title, models_list,lama_alltrain_model,
 
                                 sampled_trajectories = locked_trajectory_samples  # For visualization
                                 print(f"  → Sampled {len(locked_trajectory_samples)} trajectories, {collision_free_count} free, selected idx={best_idx}")
-                            else:
-                                locked_trajectory_samples = None
-                                locked_trajectory = goal_vec_for_sampling * DELTA_SCALE  # Fallback: direct
+                            # else:
+                            #     locked_trajectory_samples = None
+                            #     locked_trajectory = goal_vec_for_sampling * DELTA_SCALE  # Fallback: direct
                             
                             # Print graph-based distance
                             path_cells = len(path_to_target) if path_to_target else 1
